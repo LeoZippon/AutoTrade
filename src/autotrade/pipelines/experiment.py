@@ -1,0 +1,902 @@
+"""Experiment pipeline: Step/Fold/Epoch/Held-out orchestration.
+
+docs/pipeline-design.md. The Pipeline schedules Data, Environment, and Agent
+in time order, freezes inputs/outputs at each boundary, and writes the single
+experiment ledger. It implements no investment logic and never rewrites
+strategy content; it only accepts, freezes, falls back, and records.
+"""
+
+from __future__ import annotations
+
+import time
+import uuid
+from collections.abc import Callable, Mapping
+from dataclasses import replace
+from pathlib import Path
+
+import pandas as pd
+
+from autotrade.environment.executor import (
+    DockerStrategyExecutor,
+    StrategyExecutor,
+    TrustedStrategyExecutor,
+)
+from autotrade.environment.artifacts import model_artifact_delta, modification_delta
+from autotrade.environment.identity import agent_visible_ref as _agent_visible_ref
+from autotrade.environment.runtime import agent_trace_path
+from autotrade.environment.replay import (
+    ContextDataProvider,
+    ExecutionPriceProvider,
+    ReplayResult,
+    run_daily_replay,
+)
+from autotrade.environment.strategy import NLQuery
+from autotrade.environment.strategy_loader import load_strategy
+
+from .agent_views import (
+    agent_visible_ledger_record as _agent_visible_ledger_record,
+    compact_fold_history as _compact_fold_history,
+)
+from autotrade.agent.runner import AgentSessionDeadlineExceeded
+from .config import (
+    ArtifactRevision,
+    ArtifactStore,
+    EvaluationBackend,
+    EvaluationRequest,
+    FoldDeveloper,
+    FoldOutcome,
+    FoldSessionRequest,
+    FoldSessionResult,
+    FrozenArtifact,
+    MetaLearner,
+    MetaSessionResult,
+    RollingExperimentConfig,
+    SnapshotProvider,
+    StepResult,
+    StrategyExperimentConfig,
+)
+from .folds import FoldSpec, build_fold_schedule, heldout_periods
+from .hitl_state import fold_session_key
+from .ledger import ExperimentLedger, latest_fold_records
+from .meta_schedule import (
+    meta_learning_id,
+    meta_learning_trigger_counts,
+    meta_record_id,
+    meta_session_key,
+)
+
+
+# A per-session deadline override may raise the fold deadline above the
+# configured maximum, bounded by this hard ceiling in minutes.
+_MAX_DEADLINE_OVERRIDE_MINUTES = 480
+
+
+class DailyStrategyPipeline:
+    def __init__(
+        self,
+        config: StrategyExperimentConfig,
+        *,
+        nl_query: NLQuery | None = None,
+        context_data: ContextDataProvider | None = None,
+        execution_price: ExecutionPriceProvider | None = None,
+        executor_factory: Callable[[StrategyExperimentConfig], StrategyExecutor]
+        | None = None,
+    ) -> None:
+        self.config = config
+        self.nl_query = nl_query
+        self.context_data = context_data
+        self.execution_price = execution_price
+        self.executor_factory = executor_factory
+
+    def run(self, daily: pd.DataFrame | str | Path) -> ReplayResult:
+        frame = pd.read_parquet(daily) if isinstance(daily, (str, Path)) else daily
+        if not isinstance(frame, pd.DataFrame):
+            raise TypeError("daily must be a pandas DataFrame or parquet path")
+        executor = self._create_executor()
+        try:
+            return run_daily_replay(
+                daily=frame,
+                strategy=executor,
+                schedule=self.config.schedule,
+                profile=self.config.broker_profile,
+                nl_query=self.nl_query,
+                context_data=self.context_data,
+                execution_price=self.execution_price,
+            )
+        finally:
+            executor.close()
+
+    def _create_executor(self) -> StrategyExecutor:
+        if self.executor_factory is not None:
+            executor = self.executor_factory(self.config)
+            if not isinstance(executor, StrategyExecutor):
+                raise TypeError("executor_factory must return a StrategyExecutor")
+            return executor
+        if self.config.execution_mode == "trusted":
+            return TrustedStrategyExecutor(load_strategy(self.config.strategy_path))
+        return DockerStrategyExecutor(self.config.strategy_path, self.config.sandbox)
+
+
+class RollingExperimentPipeline:
+    """Step → Fold → Epoch → Held-out orchestration over injected backends."""
+
+    def __init__(
+        self,
+        config: RollingExperimentConfig,
+        *,
+        snapshots: SnapshotProvider,
+        artifacts: ArtifactStore,
+        evaluator: EvaluationBackend,
+        developer: FoldDeveloper,
+        meta_learner: MetaLearner | None = None,
+        ledger: ExperimentLedger | None = None,
+    ) -> None:
+        self.config = config
+        self.snapshots = snapshots
+        self.artifacts = artifacts
+        self.evaluator = evaluator
+        self.developer = developer
+        self.meta_learner = meta_learner
+        self.ledger = ledger or ExperimentLedger(config.ledger_path)
+
+    def run(self, trading_days: list[str]) -> dict[str, object]:
+        if self.ledger.read():
+            raise RuntimeError("batch experiments require an empty experiment ledger")
+        folds = build_fold_schedule(
+            self.config.first_test_period,
+            self.config.last_test_period,
+            trading_days,
+            window_months=self.config.window_months,
+            period=self.config.fold_period,
+            min_region_trade_days=self.config.min_region_trade_days,
+        )
+        parent: FrozenArtifact | None = None
+        taste = ""
+        final_epoch = ""
+        for epoch_index in range(1, self.config.epochs + 1):
+            epoch_id = f"epoch_{epoch_index:03d}"
+            final_epoch = epoch_id
+            triggers = set(
+                meta_learning_trigger_counts(
+                    len(folds), self.config.meta_learning_fold_interval
+                )
+            )
+            for fold_index, fold in enumerate(folds):
+                if self.meta_learner is not None and fold_index in triggers:
+                    taste, parent = self._run_meta(
+                        epoch_id, fold_index, fold, parent, taste
+                    )
+                outcome = self.run_fold(epoch_id, fold, parent=parent, taste=taste)
+                parent = outcome.frozen
+        # Fail-fast path: only reachable when every Fold ended with no freezable
+        # artifact at all (integrity failures); acceptance shortfalls alone never
+        # land here because they still freeze with warnings.
+        if parent is None:
+            raise RuntimeError("experiment produced no frozen strategy")
+        heldout_count = self.run_heldout(final_epoch, parent, trading_days)
+        return {
+            "final_strategy_artifact": parent.artifact_id,
+            "heldout_runs": heldout_count,
+        }
+
+    def run_fold(
+        self,
+        epoch_id: str,
+        fold: FoldSpec,
+        *,
+        parent: FrozenArtifact | None,
+        taste: str,
+        session_context: dict[str, object] | None = None,
+    ) -> FoldOutcome:
+        run_started = time.monotonic()
+        run_id = f"run_{uuid.uuid4().hex}"
+        context = dict(session_context or {})
+        progress = _optional_hook(context.get("progress_hook"), "progress_hook")
+        budgets = _session_budgets(self.config, context.get("resource_override"))
+        retained_artifact_id = parent.artifact_id if parent is not None else None
+        try:
+            _publish_progress(
+                progress, "pit_snapshot", run_id=run_id, phase="validation"
+            )
+            valid_snapshot = self.snapshots.prepare(
+                fold=fold,
+                phase="valid",
+                start=fold.validation_start,
+                end=fold.validation_end,
+                decision_time=fold.valid_decision_time,
+            )
+            try:
+                session = self.developer(
+                    FoldSessionRequest(
+                        experiment_id=self.config.experiment_id,
+                        epoch_id=epoch_id,
+                        fold=fold,
+                        run_id=run_id,
+                        parent=parent,
+                        taste=taste,
+                        snapshot=valid_snapshot,
+                        max_steps=budgets["max_steps"],
+                        max_backtests=budgets["max_backtests"],
+                        max_llm_calls=budgets["max_llm_calls"],
+                        deadline_seconds=budgets["deadline_seconds"],
+                        directive=str(context.get("directive") or ""),
+                        prompt_override=str(context.get("prompt_override") or ""),
+                        sandbox_gpu_count=_optional_gpu_count(
+                            context.get("sandbox_gpu_count")
+                        ),
+                        fold_period=self.config.fold_period,
+                        epoch_index=_epoch_index(epoch_id),
+                        phase=(
+                            "convergence"
+                            if _epoch_index(epoch_id)
+                            >= self.config.convergence_start_epoch
+                            else "exploration"
+                        ),
+                        acceptance_rules=self.config.acceptance.to_record(),
+                        modification_constraints=replace(
+                            self.config.step_constraints,
+                            is_initial_artifact=parent is None,
+                        ).for_epoch(_epoch_index(epoch_id)),
+                        snapshot_config=_snapshot_config_record(self.snapshots),
+                        record_failed_attempts=self.config.record_failed_attempts,
+                        nl_failure_policy=self.config.nl_failure_policy,
+                        finalize_before_deadline_seconds=self.config.finalize_before_deadline_seconds,
+                        step_gate_hook=_optional_hook(
+                            context.get("step_gate_hook"), "step_gate_hook"
+                        ),
+                        user_question_hook=_optional_hook(
+                            context.get("user_question_hook"),
+                            "user_question_hook",
+                        ),
+                        progress_hook=progress,
+                    )
+                )
+            except AgentSessionDeadlineExceeded as exc:
+                # Expected control flow: the session already emitted
+                # session_end{deadline_exceeded} after its wrap-up grace.
+                # Record a no-candidate fold instead of failing the run; the
+                # fallback chain below decides what the next fold inherits.
+                session = FoldSessionResult(
+                    conversation_id=exc.conversation_id,
+                    steps=(),
+                    selected_step_id=None,
+                    finish_reason="deadline_grace_exhausted",
+                )
+            if len(session.steps) > budgets["max_steps"]:
+                raise RuntimeError("Fold developer exceeded the Step budget")
+            selected = _select_step(session.steps, session.selected_step_id)
+            hard: list[str] = ["no_complete_validation"]
+            warnings: list[str] = []
+            if selected is not None:
+                hard, warnings = self.config.acceptance.evaluate(
+                    selected.validation.summary,
+                    complete=selected.validation.complete,
+                )
+            if selected is not None and not hard:
+                artifact_id = (
+                    f"strategy_{epoch_id}_{fold.fold_id}_{uuid.uuid4().hex[:12]}"
+                )
+                frozen = self.artifacts.freeze_revision(
+                    selected.revision_id,
+                    artifact_id=artifact_id,
+                    experiment_id=self.config.experiment_id,
+                    epoch_id=epoch_id,
+                    fold_id=fold.fold_id,
+                    run_id=run_id,
+                    step_id=selected.step_id,
+                )
+                status = "frozen"
+                validation = selected.validation.summary
+            elif parent is not None:
+                if parent.requires_validation:
+                    self._assert_parent_validated_in_fold(parent, session.steps)
+                    parent = replace(parent, requires_validation=False)
+                frozen = parent
+                status = "no_update" if selected is not None else "no_valid_backtest"
+                validation = (
+                    selected.validation.summary if selected is not None else None
+                )
+            else:
+                # First fold without an acceptable baseline: never terminate
+                # the run. Record baseline_missing (with the rejection
+                # reasons when a candidate existed) and continue with the
+                # later folds; the run only fails at the end if no fold ever
+                # froze an artifact.
+                frozen = None
+                status = "baseline_missing"
+                validation = (
+                    selected.validation.summary if selected is not None else None
+                )
+            test_result_ref: str | None = None
+            if frozen is not None:
+                _publish_progress(progress, "frozen_test", run_id=run_id)
+                test_snapshot = self.snapshots.prepare(
+                    fold=fold,
+                    phase="frozen_test",
+                    start=fold.test_start,
+                    end=fold.test_end,
+                    decision_time=fold.test_decision_time,
+                )
+                try:
+                    test_result = self.evaluator.evaluate(
+                        EvaluationRequest(
+                            revision=_frozen_revision(frozen),
+                            snapshot=test_snapshot,
+                            mode="frozen_test",
+                            start=fold.test_start,
+                            end=fold.test_end,
+                            schedule=self.config.schedule,
+                            broker_profile=self.config.broker_profile,
+                        )
+                    )
+                    test_summary = test_result.summary
+                    test_result_ref = test_result.result_ref
+                except Exception as exc:  # noqa: BLE001 - Frozen Test is diagnostic evidence
+                    # Frozen Test is diagnostic only: it cannot undo an already
+                    # accepted revision, but the failure must remain explicit.
+                    test_summary = {
+                        "status": "failed",
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+            else:
+                test_snapshot = None
+                test_summary = {"status": "skipped_no_frozen_artifact"}
+            _publish_progress(progress, "publishing", run_id=run_id)
+            record = {
+                "record_type": "fold",
+                "experiment_id": self.config.experiment_id,
+                "epoch_id": epoch_id,
+                "fold_id": fold.fold_id,
+                "run_id": run_id,
+                "session_key": fold_session_key(epoch_id, fold.fold_id),
+                **fold.to_record(),
+                "parent_strategy_artifact_id": parent.artifact_id if parent else None,
+                "conversation_id": session.conversation_id,
+                "finish_reason": session.finish_reason,
+                "fold_status": status,
+                "accept_reasons": hard,
+                "accept_warnings": warnings,
+                "selected_step_id": selected.step_id if selected is not None else None,
+                "steps": [_step_record(step) for step in session.steps],
+                "frozen_strategy_artifact_id": frozen.artifact_id
+                if frozen is not None
+                else None,
+                "frozen_strategy_artifact_path": (
+                    str(frozen.path) if frozen is not None else None
+                ),
+                "validation_result": validation,
+                "test_result": test_summary,
+                "test_result_ref": test_result_ref,
+                "run_manifest_ref": session.run_manifest_ref,
+                # HITL re-run tag and the step-node parent override that started
+                # this session: recorded for audit and for the runner's
+                # "this rerun request is absorbed" check.
+                "rerun_id": str(context.get("rerun_id") or "") or None,
+                "parent_override": str(context.get("parent_override") or "") or None,
+                "snapshot_ids": {
+                    "valid_decision_input": valid_snapshot.snapshot_id,
+                    "test_decision_input": (
+                        test_snapshot.snapshot_id if test_snapshot is not None else None
+                    ),
+                },
+                **_session_timing(context, run_started),
+            }
+            self.ledger.append(record)
+            retained_artifact_id = frozen.artifact_id if frozen is not None else None
+            return FoldOutcome(
+                fold.fold_id, run_id, status, frozen, validation, test_summary
+            )
+        except Exception as exc:
+            self.ledger.append(
+                {
+                    "record_type": "attempt_failed",
+                    "experiment_id": self.config.experiment_id,
+                    "epoch_id": epoch_id,
+                    "fold_id": fold.fold_id,
+                    "run_id": run_id,
+                    "phase": "fold",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+            raise
+        finally:
+            prune = getattr(self.artifacts, "prune_transient", None)
+            if callable(prune):
+                prune(
+                    keep_frozen_ids=(retained_artifact_id,)
+                    if retained_artifact_id is not None
+                    else ()
+                )
+
+    def run_heldout(
+        self,
+        epoch_id: str,
+        final: FrozenArtifact,
+        trading_days: list[str],
+        *,
+        replay: bool = False,
+    ) -> int:
+        count = 0
+        # A re-run fold invalidates every earlier Held-out result: they scored a
+        # frontier that no longer exists, so the caller replays them against the
+        # new one (append-only ledger; consumers read latest-per-label).
+        completed = (
+            set()
+            if replay
+            else {
+                str(record.get("period"))
+                for record in self.ledger.read("heldout")
+                if record.get("period")
+            }
+        )
+        for period in heldout_periods(
+            self.config.heldout_first_period,
+            self.config.heldout_last_period,
+            trading_days,
+            period=self.config.fold_period,
+            min_region_trade_days=self.config.min_region_trade_days,
+        ):
+            run_id = f"run_{uuid.uuid4().hex}"
+            label = str(period["label"])
+            if label in completed:
+                continue
+            snapshot = self.snapshots.prepare(
+                fold=None,
+                phase="heldout",
+                start=str(period["start"]),
+                end=str(period["end"]),
+                decision_time=period["decision_time"],  # type: ignore[arg-type]
+            )
+            result = self.evaluator.evaluate(
+                EvaluationRequest(
+                    revision=_frozen_revision(final),
+                    snapshot=snapshot,
+                    mode="heldout",
+                    start=str(period["start"]),
+                    end=str(period["end"]),
+                    schedule=self.config.schedule,
+                    broker_profile=self.config.broker_profile,
+                )
+            )
+            self.ledger.append(
+                {
+                    "record_type": "heldout",
+                    "experiment_id": self.config.experiment_id,
+                    "epoch_id": epoch_id,
+                    "fold_id": f"heldout_{label}",
+                    "run_id": run_id,
+                    "session_key": "heldout",
+                    "period": label,
+                    "strategy_artifact_id": final.artifact_id,
+                    "snapshot_id": snapshot.snapshot_id,
+                    "result": result.summary,
+                    "result_ref": result.result_ref,
+                }
+            )
+            count += 1
+        return count
+
+    def _run_meta(
+        self,
+        epoch_id: str,
+        completed_folds: int,
+        visible_fold: FoldSpec,
+        parent: FrozenArtifact | None,
+        previous_taste: str,
+        session_context: dict[str, object] | None = None,
+    ) -> tuple[str, FrozenArtifact | None]:
+        if self.meta_learner is None:
+            return previous_taste, parent
+        run_started = time.monotonic()
+        run_id = f"run_{uuid.uuid4().hex}"
+        session_id = meta_learning_id(epoch_id, completed_folds)
+        deadline_exceeded = False
+        try:
+            context = dict(session_context or {})
+            progress = _optional_hook(context.get("progress_hook"), "progress_hook")
+            _publish_progress(progress, "pit_snapshot", run_id=run_id, phase="meta")
+            history = _development_history(self.ledger.read())
+            meta_snapshot = self.snapshots.prepare(
+                fold=visible_fold,
+                phase="meta",
+                start=visible_fold.validation_start,
+                end=visible_fold.validation_end,
+                decision_time=visible_fold.valid_decision_time,
+            )
+            try:
+                session = self.meta_learner(
+                    {
+                        "experiment_id": self.config.experiment_id,
+                        "epoch_id": epoch_id,
+                        "run_id": run_id,
+                        "meta_learning_id": session_id,
+                        "trigger_after_folds": completed_folds,
+                        "visible_fold": _agent_visible_fold(visible_fold),
+                        "snapshot_id": meta_snapshot.snapshot_id,
+                        "data_summary_ref": meta_snapshot.data_summary_ref,
+                        "parent_artifact_id": parent.artifact_id if parent else None,
+                        "previous_taste": previous_taste,
+                        "development_history": history,
+                        "meta_learning_memory": self._prior_meta_learning_logs(
+                            session_id
+                        ),
+                        "directive": str(context.get("directive") or ""),
+                        "prompt_override": str(context.get("prompt_override") or ""),
+                        "user_question_hook": _optional_hook(
+                            context.get("user_question_hook"),
+                            "user_question_hook",
+                        ),
+                        "progress_hook": progress,
+                        "network": "disabled",
+                    }
+                )
+            except AgentSessionDeadlineExceeded as exc:
+                # Expected control flow: the meta session closed gracefully at
+                # its deadline. Keep the previous Taste and parent, record the
+                # outcome, and let the run continue with the next session.
+                session = MetaSessionResult(
+                    taste=previous_taste,
+                    conversation_id=exc.conversation_id,
+                )
+                deadline_exceeded = True
+            taste = str(session.taste).strip()
+            # Candidate selection and the freeze are the Pipeline's, exactly as
+            # for a Fold's selected Step: the Meta session only nominates, and
+            # adoption is decided here on the modification check's own verdict
+            # (`session.allowed`), never on the nomination alone. A learner that
+            # offers a revision the check refused must not have it adopted --
+            # a meta-regularized artifact becomes the next Fold's parent.
+            status = "taste_only"
+            frozen = parent
+            if deadline_exceeded:
+                status = "deadline_exceeded_kept_previous"
+            elif parent is not None and session.allowed and session.revision_id:
+                frozen = self.artifacts.freeze_revision(
+                    session.revision_id,
+                    artifact_id=f"strategy_{session_id}_meta_learning",
+                    experiment_id=self.config.experiment_id,
+                    epoch_id=epoch_id,
+                    fold_id=session_id,
+                    run_id=run_id,
+                    step_id="meta_learning",
+                )
+                frozen = FrozenArtifact(
+                    frozen.artifact_id,
+                    Path(frozen.path),
+                    Path(frozen.model_path) if frozen.model_path is not None else None,
+                    run_id,
+                    session_id,
+                    "meta_learning",
+                    session.revision_id,
+                    # Never backtested: the next Fold may only fall back to it
+                    # after validating identical content itself.
+                    requires_validation=True,
+                )
+                status = "meta_regularized"
+            elif parent is not None and session.allowed:
+                status = "taste_only_kept_parent"
+            elif parent is not None:
+                status = "rejected_kept_parent"
+            _publish_progress(progress, "publishing", run_id=run_id)
+            trace_ref = agent_trace_path(
+                self.config.experiment_dir / "artifacts", run_id
+            )
+            self.ledger.append(
+                {
+                    "record_type": "meta_learning",
+                    "experiment_id": self.config.experiment_id,
+                    "epoch_id": epoch_id,
+                    "fold_id": session_id,
+                    "run_id": run_id,
+                    "session_key": meta_session_key(epoch_id, completed_folds),
+                    "meta_learning_id": session_id,
+                    "trigger_after_folds": completed_folds,
+                    "taste": taste,
+                    "status": status,
+                    "modification_check": dict(session.modification_check),
+                    "frozen_strategy_artifact_id": (
+                        frozen.artifact_id
+                        if status == "meta_regularized" and frozen
+                        else None
+                    ),
+                    "frozen_strategy_artifact_path": (
+                        str(frozen.path)
+                        if status == "meta_regularized" and frozen
+                        else None
+                    ),
+                    "agent_trace_ref": str(trace_ref) if trace_ref.exists() else None,
+                    **_session_timing(context, run_started),
+                }
+            )
+            return taste, frozen
+        except Exception as exc:
+            self.ledger.append(
+                {
+                    "record_type": "attempt_failed",
+                    "experiment_id": self.config.experiment_id,
+                    "epoch_id": epoch_id,
+                    "fold_id": session_id,
+                    "run_id": run_id,
+                    "session_key": meta_session_key(epoch_id, completed_folds),
+                    "phase": "meta_learning",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+            raise
+
+    def _assert_parent_validated_in_fold(
+        self, parent: FrozenArtifact, steps: tuple[StepResult, ...]
+    ) -> None:
+        """Refuse to fall back to a meta-regularized parent this Fold never validated.
+
+        A meta-regularized artifact enters the Fold without a backtest. Falling
+        back to it silently would ship an unvalidated strategy. Closed matches
+        the parent to a complete Validation by artifact hash; item 5 removed
+        hashes, so identity is established by comparing the trees directly —
+        a Step whose revision differs from the parent in no file validated
+        something else, not this parent.
+        """
+        for step in steps:
+            if not step.validation.complete:
+                continue
+            revision = self.artifacts.revision(step.revision_id)
+            if modification_delta(parent.path, revision.output_path).changed_files:
+                continue
+            models = getattr(revision, "models_path", None)
+            if (
+                models is not None
+                and parent.model_path is not None
+                and model_artifact_delta(parent.model_path, models).changed_files
+            ):
+                continue
+            hard, _ = self.config.acceptance.evaluate(
+                step.validation.summary, complete=step.validation.complete
+            )
+            if not hard:
+                return
+        raise RuntimeError(
+            "Meta-regularized parent has no acceptable complete Validation in this Fold; "
+            "refusing unvalidated fallback"
+        )
+
+    def _prior_meta_learning_logs(self, current_meta_learning_id: str) -> str:
+        """Latest prior Meta trace from each of the most recent N Epochs.
+
+        Periodic sessions in the current Epoch are eligible, so the immediate
+        predecessor remains visible without allowing raw-memory growth to
+        multiply by the number of interval triggers.
+        """
+        chunks: list[str] = []
+        keep = max(0, self.config.meta_memory_max_epochs)
+        if not keep:
+            return ""
+        latest_by_epoch: dict[str, dict[str, object]] = {}
+        epoch_order: list[str] = []
+        for record in self.ledger.read("meta_learning"):
+            if meta_record_id(record) == current_meta_learning_id:
+                continue
+            epoch = str(record.get("epoch_id") or "")
+            if epoch not in latest_by_epoch:
+                epoch_order.append(epoch)
+            latest_by_epoch[epoch] = record
+        for epoch in epoch_order[-keep:]:
+            trace = self._meta_learning_trace_ref(latest_by_epoch[epoch])
+            if not trace.exists():
+                continue
+            text = trace.read_text(encoding="utf-8")
+            if text.strip():
+                chunks.append(text if text.endswith("\n") else text + "\n")
+        return "".join(chunks)
+
+    def _meta_learning_trace_ref(self, record: Mapping[str, object]) -> Path:
+        ref = record.get("agent_trace_ref")
+        if ref:
+            return Path(str(ref))
+        run_id = record.get("run_id")
+        if run_id:
+            return agent_trace_path(
+                self.config.experiment_dir / "artifacts", str(run_id)
+            )
+        return Path("__missing_meta_learning_agent_trace__")
+
+    def run_meta_session(
+        self,
+        epoch_id: str,
+        completed_folds: int,
+        visible_fold: FoldSpec,
+        *,
+        parent: FrozenArtifact | None,
+        previous_taste: str,
+        session_context: dict[str, object] | None = None,
+    ) -> tuple[str, FrozenArtifact | None]:
+        """Run one scheduled Meta session through the canonical ledger path.
+
+        Returns the Taste and the parent the next Fold must start from — the
+        meta-regularized artifact when the session produced one.
+        """
+
+        return self._run_meta(
+            epoch_id,
+            completed_folds,
+            visible_fold,
+            parent,
+            previous_taste,
+            session_context,
+        )
+
+
+def _select_step(
+    steps: tuple[StepResult, ...], selected_id: str | None
+) -> StepResult | None:
+    complete = [step for step in steps if step.validation.complete]
+    if selected_id is None:
+        return complete[-1] if complete else None
+    selected = next((step for step in steps if step.step_id == selected_id), None)
+    if selected is None:
+        raise RuntimeError(f"selected Step is absent: {selected_id}")
+    if not selected.validation.complete:
+        raise RuntimeError("selected Step lacks complete validation")
+    return selected
+
+
+def _epoch_index(epoch_id: str) -> int:
+    _, _, number = epoch_id.rpartition("_")
+    try:
+        return int(number)
+    except ValueError:
+        return 1
+
+
+def _snapshot_config_record(snapshots: SnapshotProvider) -> dict[str, object]:
+    """The provider's own decision-window configuration, when it has one.
+
+    ``build_experiment_facts`` reads ``snapshot_config.decision_windows`` for the
+    visible-timeline block; the local daily provider has no such configuration.
+    """
+    config = getattr(snapshots, "config", None)
+    to_record = getattr(config, "to_record", None)
+    return dict(to_record()) if callable(to_record) else {}
+
+
+def _step_record(step: StepResult) -> dict[str, object]:
+    return {
+        "step_id": step.step_id,
+        "revision_id": step.revision_id,
+        "complete_validation": step.validation.complete,
+        "summary": step.validation.summary,
+        "validation_result_ref": step.validation.result_ref,
+    }
+
+
+def _frozen_revision(artifact: FrozenArtifact) -> ArtifactRevision:
+    return ArtifactRevision(artifact.artifact_id, artifact.path, artifact.model_path)
+
+
+def _development_history(records: list[dict[str, object]]) -> dict[str, object]:
+    """Meta-visible development history: whitelisted Fold and Meta projections.
+
+    Every field crosses the Agent boundary, so it is built exclusively from
+    ``agent_views``: raw fold ids become opaque refs and Test evidence is
+    limited to the compact frozen-test metric whitelist of already-completed
+    Folds. Held-out never appears.
+    """
+
+    folds = list(latest_fold_records(records).values())
+    return {
+        "evaluation_contract": {
+            "validation": "Fold selection and iteration evidence",
+            "frozen_test": "compact completed-Fold metrics are adaptive meta-development feedback",
+            "heldout": "never visible; sole final untouched evaluation",
+        },
+        "fold_backtest_summaries": [
+            _compact_fold_history(record, include_frozen_test_metrics=True)
+            for record in folds
+        ],
+        "meta_learning": [
+            _agent_visible_ledger_record(record, include_frozen_test_metrics=True)
+            for record in records
+            if record.get("record_type") == "meta_learning"
+        ],
+    }
+
+
+def _optional_hook(value: object, name: str):
+    if value is None:
+        return None
+    if not callable(value):
+        raise TypeError(f"{name} must be callable")
+    return value
+
+
+def _publish_progress(hook, stage: str, **progress: object) -> None:
+    if hook is not None:
+        hook(stage, dict(progress) if progress else None)
+
+
+def _session_timing(
+    context: Mapping[str, object],
+    fallback_started: float,
+) -> dict[str, float]:
+    callback = context.get("session_timing")
+    if callable(callback):
+        value = callback()
+        if not isinstance(value, Mapping):
+            raise TypeError("session_timing must return a mapping")
+        wall = float(value.get("run_wall_seconds", 0.0))
+        wait = float(value.get("researcher_wait_seconds", 0.0))
+        if wall < 0 or wait < 0:
+            raise ValueError("session timing values must be non-negative")
+        return {
+            "run_wall_seconds": round(wall, 1),
+            "researcher_wait_seconds": round(wait, 1),
+        }
+    return {
+        "run_wall_seconds": round(max(0.0, time.monotonic() - fallback_started), 1),
+        "researcher_wait_seconds": 0.0,
+    }
+
+
+def _agent_visible_fold(fold: FoldSpec) -> dict[str, object]:
+    # The raw fold id encodes the held-out test period, so the Meta session
+    # sees the same opaque ref every other agent-visible surface projects.
+    return {
+        "fold_id": _agent_visible_ref(fold.fold_id, prefix="fold_ref"),
+        "input_window": f"{fold.input_window_start}..{fold.input_window_end}",
+        "validation_period": f"{fold.validation_start}..{fold.validation_end}",
+        "valid_decision_time": fold.valid_decision_time.isoformat(),
+    }
+
+
+def _optional_gpu_count(value: object) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError("sandbox_gpu_count override must be a positive integer")
+    return value
+
+
+def _session_budgets(
+    config: RollingExperimentConfig, override: object
+) -> dict[str, int | float]:
+    limits: dict[str, int | float] = {
+        "max_steps": config.max_steps_per_fold,
+        "max_backtests": config.max_backtests_per_fold,
+        "max_llm_calls": config.max_llm_calls,
+        "deadline_seconds": config.max_fold_minutes * 60,
+    }
+    if override not in (None, {}):
+        if not isinstance(override, dict):
+            raise TypeError("resource_override must be an object")
+        unknown = sorted(set(override).difference(limits))
+        if unknown:
+            raise ValueError(f"unknown resource override(s): {unknown}")
+        for name, value in override.items():
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or float(value) <= 0
+            ):
+                raise ValueError(f"{name} override must be positive")
+            if name == "deadline_seconds":
+                # The fold deadline may be raised per session, bounded by the
+                # 240-minute hard ceiling; the other budgets stay downward-only.
+                if float(value) > _MAX_DEADLINE_OVERRIDE_MINUTES * 60:
+                    raise ValueError(
+                        "deadline_seconds override cannot exceed "
+                        f"{_MAX_DEADLINE_OVERRIDE_MINUTES} minutes"
+                    )
+            elif float(value) > float(limits[name]):
+                raise ValueError(
+                    f"{name} override cannot exceed the configured Fold limit"
+                )
+            limits[name] = float(value) if name == "deadline_seconds" else int(value)
+    # The budget handed to the session is main deadline plus the trailing
+    # wrap-up grace window; the runner reserves that trailing window for
+    # wrap-up (reaching the main deadline never interrupts the model).
+    limits["deadline_seconds"] = (
+        float(limits["deadline_seconds"]) + config.deadline_grace_minutes * 60
+    )
+    return limits
+
+
+ExperimentPipeline = DailyStrategyPipeline

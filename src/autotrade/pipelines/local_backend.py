@@ -1,0 +1,1457 @@
+"""Runnable baseline and LLM backends for the daily JSON rolling pipeline."""
+
+from __future__ import annotations
+
+import json
+import shutil
+import uuid
+from collections.abc import Callable, Mapping, Sequence
+from contextlib import contextmanager, nullcontext
+from dataclasses import replace
+from datetime import datetime
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+import pandas as pd
+
+from autotrade.agent.compact import ContextCompactionConfig
+from autotrade.agent.experiment_facts import build_experiment_facts
+from autotrade.environment.artifacts import (
+    FilesystemArtifactStore,
+    ModificationConstraints,
+    copy_artifact,
+    copy_model_artifacts,
+    restore_working_artifacts_writable,
+)
+from autotrade.environment.data.summary import write_agent_data_summary
+from autotrade.environment.executor import PersistentCommandRunner
+from autotrade.environment.identity import agent_visible_ref
+from autotrade.environment.replay.style import replay_style_analysis, write_style_rollup
+from autotrade.environment.runtime import (
+    AgentTraceWriter,
+    RunManifest,
+    agent_trace_path,
+    chmod_tree,
+    write_json_atomic,
+)
+from autotrade.environment.sandbox import (
+    DockerSandbox,
+    LocalSandbox,
+    SandboxSpec,
+    link_copytree,
+)
+from autotrade.environment.sandbox_images import (
+    SANDBOX_ENVIRONMENT_REQUEST_NAME,
+    maybe_rebuild_sandbox_image,
+    write_sandbox_environment_example,
+)
+from autotrade.environment.step_tree import StepTree
+from autotrade.environment.strategy_loader import validate_strategy_source
+from autotrade.environment.time_budget import (
+    InferenceTimeBudget,
+    SessionTimeBudgetAware,
+)
+from autotrade.environment.tools.base import (
+    CommandRunner,
+    Tool,
+    ToolError,
+    ToolRegistry,
+    ToolResult,
+    ToolSpec,
+)
+from autotrade.environment.tools.files import EditFileTool, WriteFileTool
+from autotrade.environment.tools.finish_fold import FinishFoldTool
+from autotrade.environment.tools.hitl import AskUserTool
+from autotrade.environment.tools.modification_check import ModificationCheckTool
+from autotrade.environment.tools.search import (
+    GlobTool,
+    GrepTool,
+    ReadFileTool,
+    SearchRoots,
+)
+from autotrade.environment.tools.shell import ReadOnlyShellTool, SandboxShellTool
+from autotrade.environment.tools.step_rollback import StepRollbackTool
+from autotrade.environment.tools.strategy_validation import StrategyValidationTool
+from autotrade.environment.tools.workspace import SafeWorkspace
+
+from .agent_views import compact_fold_history
+from .config import (
+    ArtifactRevision,
+    EvaluationBackend,
+    EvaluationRequest,
+    EvaluationResult,
+    FoldSessionRequest,
+    FoldSessionResult,
+    MetaSessionResult,
+    SnapshotBundle,
+    StepResult,
+    StrategyExperimentConfig,
+)
+from .experiment import DailyStrategyPipeline
+from .ledger import ExperimentLedger, latest_fold_records
+
+if TYPE_CHECKING:
+    from autotrade.environment.llm import ChatMessage, LLMProxy, ProviderResponse
+
+
+class LocalDailySnapshotProvider:
+    """Bind every phase to one immutable path selected at worker startup."""
+
+    def __init__(self, daily_path: str | Path) -> None:
+        self.daily_path = Path(daily_path).resolve(strict=True)
+        if not self.daily_path.is_file():
+            raise ValueError("daily_path must be a local Parquet file")
+
+    def prepare(
+        self,
+        *,
+        fold,
+        phase: str,
+        start: str,
+        end: str,
+        decision_time: datetime,
+    ) -> SnapshotBundle:
+        del fold
+        if phase not in {"meta", "valid", "frozen_test", "heldout"}:
+            raise ValueError(f"unsupported local snapshot phase: {phase}")
+        return SnapshotBundle(
+            snapshot_id=f"local_daily_{phase}_{start}_{end}",
+            decision_ref=str(self.daily_path),
+            replay_ref=str(self.daily_path),
+            data_summary_ref="",
+            generation_id="local_daily",
+        )
+
+
+class LocalDailyEvaluationBackend:
+    """Evaluate an immutable strategy revision through DailyStrategyPipeline."""
+
+    def __init__(
+        self,
+        daily_path: str | Path,
+        results_root: str | Path,
+        *,
+        execution_mode: str,
+        executor_factory=None,
+    ) -> None:
+        if execution_mode not in {"sandbox", "trusted"}:
+            raise ValueError("execution_mode must be sandbox or trusted")
+        self.daily_path = Path(daily_path).resolve(strict=True)
+        self.results_root = Path(results_root).resolve()
+        self.execution_mode = execution_mode
+        self.executor_factory = executor_factory
+        self._daily = pd.read_parquet(self.daily_path)
+        if "trade_date" not in self._daily.columns:
+            raise ValueError("daily Parquet must contain trade_date")
+        self._daily = self._daily.copy()
+        self._daily["trade_date"] = self._daily["trade_date"].map(_date_key)
+
+    @property
+    def trading_days(self) -> list[str]:
+        return sorted(set(self._daily["trade_date"].tolist()))
+
+    def frame_between(self, start: str, end: str) -> pd.DataFrame:
+        return self._daily[
+            (self._daily["trade_date"] >= _date_key(start))
+            & (self._daily["trade_date"] <= _date_key(end))
+        ].copy()
+
+    def evaluate(self, request: EvaluationRequest) -> EvaluationResult:
+        if request.mode not in {"valid", "frozen_test", "heldout"}:
+            raise ValueError(f"unsupported local evaluation mode: {request.mode}")
+        strategy_path = Path(request.revision.output_path) / "main.py"
+        if not strategy_path.is_file():
+            raise FileNotFoundError(f"strategy revision has no main.py: {strategy_path}")
+        validate_strategy_source(strategy_path.read_text(encoding="utf-8"), filename="main.py")
+        frame = self.frame_between(request.start, request.end)
+        if frame.empty:
+            raise ValueError(f"daily replay is empty for {request.start}..{request.end}")
+        config = StrategyExperimentConfig(
+            strategy_path=strategy_path,
+            schedule=request.schedule,
+            broker_profile=request.broker_profile,
+            execution_mode=self.execution_mode,  # type: ignore[arg-type]
+        )
+        replay = DailyStrategyPipeline(
+            config,
+            executor_factory=self.executor_factory,
+        ).run(frame)
+        record = replay.to_record()
+        result_id = f"{request.mode}_{uuid.uuid4().hex}"
+        target = self.results_root / result_id / "result.json"
+        target.parent.mkdir(parents=True, exist_ok=False)
+        target.write_text(
+            json.dumps(record, ensure_ascii=False, allow_nan=False, default=str, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        if request.mode == "valid":
+            write_style_rollup(
+                target.parent,
+                replay_style_analysis(
+                    replay,
+                    frame,
+                    replay_dir=None,
+                    snapshot_dir=None,
+                    mode=request.mode,
+                ),
+            )
+        summary = record.get("stats")
+        if not isinstance(summary, dict):
+            raise TypeError("daily replay omitted stats")
+        return EvaluationResult(dict(summary), str(target), complete=True)
+
+
+class DeterministicBaselineDeveloper:
+    """Create one Step by replaying the supplied baseline without modifying it."""
+
+    def __init__(
+        self,
+        *,
+        baseline_strategy: str | Path,
+        artifact_store: FilesystemArtifactStore,
+        evaluator: EvaluationBackend,
+        schedule,
+        broker_profile,
+    ) -> None:
+        self.baseline_strategy = Path(baseline_strategy).resolve(strict=True)
+        self.artifact_store = artifact_store
+        self.evaluator = evaluator
+        self.schedule = schedule
+        self.broker_profile = broker_profile
+        if not self.baseline_strategy.is_file():
+            raise ValueError("baseline strategy must be a file")
+        validate_strategy_source(
+            self.baseline_strategy.read_text(encoding="utf-8"),
+            filename=self.baseline_strategy.name,
+        )
+        self.baseline_root = self.artifact_store.root / "baseline_source"
+        self.baseline_root.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(self.baseline_strategy, self.baseline_root / "main.py")
+
+    def __call__(self, request: FoldSessionRequest) -> FoldSessionResult:
+        source = request.parent.path if request.parent is not None else self.baseline_root
+        revision = self.artifact_store.create_revision(
+            source,
+            models_path=request.parent.model_path if request.parent is not None else None,
+        )
+        typed_revision = ArtifactRevision(
+            str(revision.revision_id),
+            Path(revision.output_path),
+            Path(revision.models_path) if revision.models_path is not None else None,
+        )
+        validation = self.evaluator.evaluate(
+            EvaluationRequest(
+                revision=typed_revision,
+                snapshot=request.snapshot,
+                mode="valid",
+                start=request.fold.validation_start,
+                end=request.fold.validation_end,
+                schedule=self.schedule,
+                broker_profile=self.broker_profile,
+            )
+        )
+        # Step ids reach the Agent through the ledger's steps[] projection, so
+        # they carry the same opaque fold ref every agent-visible surface uses.
+        step_id = f"baseline_{agent_visible_ref(request.fold.fold_id, prefix='fold_ref')}"
+        return FoldSessionResult(
+            conversation_id=f"deterministic_baseline_{request.run_id}",
+            steps=(StepResult(step_id, typed_revision.revision_id, validation, selected=True),),
+            selected_step_id=step_id,
+            finish_reason="deterministic_baseline_replay_no_agent_improvement",
+        )
+
+
+class SessionCallBudget:
+    """One counter and deadline shared across all model roles in a session."""
+
+    def __init__(
+        self,
+        *,
+        max_calls: int,
+        deadline: float | None = None,
+        time_budget: InferenceTimeBudget | None = None,
+    ) -> None:
+        if max_calls <= 0:
+            raise ValueError("max_calls must be positive")
+        if (deadline is None) == (time_budget is None):
+            raise ValueError("provide exactly one of deadline or time_budget")
+        self.max_calls = max_calls
+        self.time_budget = time_budget or InferenceTimeBudget(deadline=deadline)
+        self.calls = 0
+
+    @property
+    def deadline(self) -> float:
+        return self.time_budget.deadline
+
+    def claim(self) -> None:
+        self.check_deadline()
+        if self.calls >= self.max_calls:
+            raise RuntimeError("Agent session LLM call budget exhausted")
+        self.calls += 1
+
+    def check_deadline(self) -> None:
+        self.time_budget.check()
+
+
+class SessionBudgetLLM(SessionTimeBudgetAware):
+    """Apply a shared session budget to one model-role gateway."""
+
+    def __init__(
+        self,
+        delegate: LLMProxy,
+        *,
+        max_calls: int | None = None,
+        deadline: float | None = None,
+        budget: SessionCallBudget | None = None,
+    ) -> None:
+        if budget is None:
+            if max_calls is None or deadline is None:
+                raise ValueError("max_calls and deadline are required without a shared budget")
+            budget = SessionCallBudget(max_calls=max_calls, deadline=deadline)
+        self.delegate = delegate
+        self.budget = budget
+
+    @property
+    def calls(self) -> int:
+        return self.budget.calls
+
+    @property
+    def provider(self) -> str:
+        return str(getattr(self.delegate, "provider", ""))
+
+    @property
+    def model(self) -> str:
+        return str(getattr(self.delegate, "model", ""))
+
+    @property
+    def context_window_tokens(self) -> int | None:
+        value = getattr(self.delegate, "context_window_tokens", None)
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+    @property
+    def time_budget(self) -> InferenceTimeBudget:
+        return self.budget.time_budget
+
+    @property
+    def session_time_budget(self) -> InferenceTimeBudget:
+        return self.time_budget
+
+    def complete(
+        self,
+        messages: Sequence[ChatMessage],
+        *,
+        tools: Sequence[Mapping[str, object]] = (),
+        tool_choice: str | Mapping[str, object] = "auto",
+        max_tokens: int | None = None,
+    ) -> ProviderResponse:
+        self.budget.claim()
+        response = self.delegate.complete(
+            messages,
+            tools=tools,
+            tool_choice=tool_choice,
+            max_tokens=max_tokens,
+        )
+        self.budget.check_deadline()
+        return response
+
+
+class FoldBacktestTool(SessionTimeBudgetAware):
+    """Commit and evaluate the current work copy as one immutable Step."""
+
+    spec = ToolSpec(
+        "daily_backtest",
+        "Commit the current output as an immutable revision and run the Fold Validation replay.",
+        {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
+    )
+
+    def __init__(
+        self,
+        *,
+        request: FoldSessionRequest,
+        output_dir: Path,
+        models_dir: Path,
+        modification_check: ModificationCheckTool,
+        artifact_store: FilesystemArtifactStore,
+        evaluator: EvaluationBackend,
+        tree: StepTree,
+        schedule,
+        broker_profile,
+        time_budget: InferenceTimeBudget,
+        formal_guard: Callable[[], object],
+        manifest: RunManifest | None = None,
+    ) -> None:
+        self.request = request
+        self.output_dir = output_dir
+        self.models_dir = models_dir
+        self.modification_check = modification_check
+        self.artifact_store = artifact_store
+        self.evaluator = evaluator
+        self.tree = tree
+        self.schedule = schedule
+        self.broker_profile = broker_profile
+        self.time_budget = time_budget
+        self.formal_guard = formal_guard
+        self.manifest = manifest
+        self.backtests = 0
+        self.steps: list[StepResult] = []
+
+    @property
+    def session_time_budget(self) -> InferenceTimeBudget:
+        return self.time_budget
+
+    def _append_manifest_summary(self, summary: dict[str, object]) -> None:
+        """Every backtest attempt, successful or not, lands in the run manifest.
+
+        It is the only durable per-run record of what the session actually ran:
+        the ledger keeps one fold record, and ``compact_fold_history`` reads
+        these summaries back out for the next Meta session.
+        """
+        if self.manifest is not None:
+            self.manifest.append_backtest_summary(summary)
+
+    def invoke(self, arguments: Mapping[str, object]) -> ToolResult:
+        del arguments
+        self._check_deadline()
+        with self.time_budget.pause():
+            return self._invoke_exempt()
+
+    def _invoke_exempt(self) -> ToolResult:
+        if self.backtests >= self.request.max_backtests:
+            raise ToolError("Fold Validation backtest budget exhausted")
+        if len(self.steps) >= self.request.max_steps:
+            raise ToolError("Fold Step budget exhausted")
+        self.backtests += 1
+        result_name = f"valid_{self.backtests:03d}"
+        revision_id = ""
+        try:
+            with self.formal_guard():
+                check = self.modification_check.invoke({})
+                revision = self.artifact_store.create_revision(
+                    self.output_dir,
+                    models_path=self.models_dir,
+                )
+                revision_id = str(revision.revision_id)
+                typed = ArtifactRevision(
+                    revision_id,
+                    Path(revision.output_path),
+                    Path(revision.models_path) if revision.models_path is not None else None,
+                )
+                evaluation = self.evaluator.evaluate(
+                    EvaluationRequest(
+                        revision=typed,
+                        snapshot=self.request.snapshot,
+                        mode="valid",
+                        start=self.request.fold.validation_start,
+                        end=self.request.fold.validation_end,
+                        schedule=self.schedule,
+                        broker_profile=self.broker_profile,
+                    )
+                )
+                self._check_deadline()
+                node_id = self.tree.record_step(
+                    typed.output_path,
+                    epoch_id=self.request.epoch_id,
+                    # Opaque the fold id so the step-tree node names the Agent
+                    # reads (steps/tree.txt|tree.json) never leak the held-out
+                    # calendar period.
+                    fold_id=agent_visible_ref(self.request.fold.fold_id, prefix="fold_ref"),
+                    run_id=self.request.run_id,
+                    result_name=result_name,
+                    revision_id=revision_id,
+                    metrics=evaluation.summary,
+                    complete_validation=evaluation.complete,
+                    models_root=typed.models_path,
+                    attachments={"validation/result.json": evaluation.result_ref},
+                )
+            step = StepResult(node_id, revision_id, evaluation)
+            self.steps.append(step)
+        except Exception as exc:
+            if self.request.record_failed_attempts:
+                self.tree.record_failed_attempt(
+                    epoch_id=self.request.epoch_id,
+                    fold_id=agent_visible_ref(self.request.fold.fold_id, prefix="fold_ref"),
+                    run_id=self.request.run_id,
+                    result_name=result_name,
+                    error=f"{type(exc).__name__}: {exc}",
+                    metrics={"revision_id": revision_id} if revision_id else None,
+                )
+            self._append_manifest_summary(
+                {
+                    "result_name": result_name,
+                    "mode": "valid",
+                    "status": "failed",
+                    "complete_validation": False,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+            if isinstance(exc, (ToolError, TimeoutError)):
+                raise
+            raise ToolError(f"daily Validation failed: {exc}") from exc
+        self._append_manifest_summary(
+            {
+                "result_name": result_name,
+                "mode": "valid",
+                "status": "ok",
+                "complete_validation": bool(evaluation.complete),
+                **{
+                    key: value
+                    for key, value in evaluation.summary.items()
+                    if not isinstance(value, (dict, list))
+                },
+            }
+        )
+        summary = {
+            "run_id": self.request.run_id,
+            "node_id": node_id,
+            "revision_id": revision_id,
+            "complete": evaluation.complete,
+            "stats": evaluation.summary,
+        }
+        directive = ""
+        if self.request.step_gate_hook is not None:
+            directive = self.request.step_gate_hook(len(self.steps), summary)
+        return ToolResult(
+            True,
+            value={
+                **summary,
+                "result_ref": evaluation.result_ref,
+                "modification_check": dict(check.value),
+                "step_directive": str(directive),
+                "backtests_used": self.backtests,
+                "backtests_remaining": self.request.max_backtests - self.backtests,
+            },
+        )
+
+    def _check_deadline(self) -> None:
+        try:
+            self.time_budget.check()
+        except TimeoutError as exc:
+            raise TimeoutError("Fold deadline exceeded") from exc
+
+
+class WriteTasteTool:
+    spec = ToolSpec(
+        "write_taste",
+        "Write the sole Meta output as taste.md.",
+        {
+            "type": "object",
+            "properties": {"taste": {"type": "string", "minLength": 1, "maxLength": 20_000}},
+            "required": ["taste"],
+            "additionalProperties": False,
+        },
+        mutating=True,
+    )
+
+    def __init__(self, workspace: SafeWorkspace) -> None:
+        self.workspace = workspace
+
+    def invoke(self, arguments: Mapping[str, object]) -> ToolResult:
+        path = self.workspace.resolve("taste.md")
+        path.write_text(str(arguments["taste"]).strip() + "\n", encoding="utf-8")
+        return ToolResult(True, value={"path": "taste.md"})
+
+
+class LLMFoldDeveloper:
+    """Adapter from the native Agent loop to ``FoldDeveloper``."""
+
+    def __init__(
+        self,
+        *,
+        llm: LLMProxy,
+        explore_llm: LLMProxy | None = None,
+        compact_llm: LLMProxy | None = None,
+        context_compaction: ContextCompactionConfig | None = None,
+        baseline_strategy: str | Path,
+        artifact_store: FilesystemArtifactStore,
+        evaluator: EvaluationBackend,
+        schedule,
+        broker_profile,
+        ledger: ExperimentLedger,
+        experiment_dir: str | Path,
+        runtime_root: str | Path,
+        sandbox_spec: SandboxSpec | None = None,
+        command_runner_factory: Callable[[Path], CommandRunner] | None = None,
+        max_response_tokens: int = 8_000,
+        explore_max_tokens: int = 6_000,
+        step_tree_enabled: bool = True,
+        fold_exploration_directive: str = "",
+    ) -> None:
+        self.llm = llm
+        self.explore_llm = explore_llm or llm
+        self.compact_llm = compact_llm
+        self.context_compaction = context_compaction or ContextCompactionConfig()
+        self.baseline_strategy = Path(baseline_strategy).resolve(strict=True)
+        self.artifact_store = artifact_store
+        self.experiment_dir = Path(experiment_dir).resolve()
+        self.evaluator = evaluator
+        self.schedule = schedule
+        self.broker_profile = broker_profile
+        self.ledger = ledger
+        self.runtime_root = Path(runtime_root).resolve()
+        self.sandbox_spec = sandbox_spec or SandboxSpec()
+        self.command_runner_factory = command_runner_factory
+        self.max_response_tokens = max_response_tokens
+        self.explore_max_tokens = explore_max_tokens
+        self.step_tree_enabled = step_tree_enabled
+        self.fold_exploration_directive = fold_exploration_directive
+        validate_strategy_source(self.baseline_strategy.read_text(encoding="utf-8"), filename=self.baseline_strategy.name)
+
+    def set_sandbox_spec(self, spec: SandboxSpec) -> None:
+        """Adopt the derived image a Meta session just built, for later Folds."""
+        self.sandbox_spec = spec
+
+    def __call__(self, request: FoldSessionRequest) -> FoldSessionResult:
+        from autotrade.agent.compact import ContextCompactor
+        from autotrade.agent.explore import ExploreSubAgentConfig, ExploreSubAgentEngine
+        from autotrade.agent.prompts import build_system_prompt
+        from autotrade.agent.runner import AgentSessionConfig, AgentSessionRunner
+
+        root = self.runtime_root / request.run_id
+        if root.exists():
+            raise FileExistsError(f"Fold runtime already exists: {request.run_id}")
+        trace = AgentTraceWriter(
+            agent_trace_path(self.artifact_store.root.parent, request.run_id),
+            ids={
+                "experiment_id": request.experiment_id,
+                "epoch_id": request.epoch_id,
+                # Stamped on every agent_trace event (agent-readable); opaque it.
+                "fold_id": agent_visible_ref(request.fold.fold_id, prefix="fold_ref"),
+                "run_id": request.run_id,
+                "session_kind": "fold",
+            },
+        )
+        _environment_phase(request.progress_hook, "sandbox_layout", request.run_id)
+        local = LocalSandbox(root)
+        paths = local.prepare_layout()
+        # Per-session HITL override; the "auto" selector still picks that many
+        # GPUs by free memory at container start.
+        sandbox_spec = (
+            self.sandbox_spec
+            if request.sandbox_gpu_count is None
+            else replace(self.sandbox_spec, gpu_count=int(request.sandbox_gpu_count))
+        )
+        # RunManifest publishes two views of the same data: the host audit copy
+        # under runtime/, and the allowlisted Agent-visible copy mounted at
+        # /mnt/artifacts/run_manifest.json. It is also where every backtest
+        # summary accumulates, which is what the next Meta session reads back
+        # through compact_fold_history's run_manifest_ref.
+        manifest = RunManifest.create(
+            paths.run_manifest,
+            {
+                "experiment_id": request.experiment_id,
+                "epoch_id": request.epoch_id,
+                # Raw on the host manifest; RunManifest's Agent-visible view and
+                # build_experiment_facts both project it through
+                # agent_visible_ref, so projecting here would double-hash it and
+                # break correlation with the step tree and the data summary.
+                "fold_id": request.fold.fold_id,
+                "run_id": request.run_id,
+                "kind": "fold",
+                "llm": {
+                    "provider": str(getattr(self.llm, "provider", "")),
+                    "model": str(getattr(self.llm, "model", "")),
+                },
+                "conversation_id": request.run_id,
+                "runtime_env_ref": "/mnt/artifacts/runtime_env.json",
+                "data_summary_ref": "/mnt/artifacts/data_summary.json",
+                "fold": {
+                    "fold_id": request.fold.fold_id,
+                    "input_window": f"{request.fold.input_window_start}..{request.fold.input_window_end}",
+                    "validation_period": f"{request.fold.validation_start}..{request.fold.validation_end}",
+                    "valid_decision_time": request.fold.valid_decision_time.isoformat(),
+                },
+                "fold_period": request.fold_period,
+                "snapshot_config": dict(request.snapshot_config),
+                "snapshots": {"valid_decision_input": {"snapshot_id": request.snapshot.snapshot_id}},
+                "valid_decision_time": request.fold.valid_decision_time.isoformat(),
+                "is_initial_artifact": request.parent is None,
+                "parent_strategy_artifact_id": (
+                    request.parent.artifact_id if request.parent is not None else None
+                ),
+                "template_ref": None if request.parent is not None else "agent_output_template",
+                "modification_constraints": request.modification_constraints.to_record(),
+                "acceptance_rules": dict(request.acceptance_rules),
+                "schedule": self.schedule.to_record(),
+                "broker_profile": self.broker_profile.to_record(),
+                "nl_failure_policy": request.nl_failure_policy,
+                "step_tree_enabled": self.step_tree_enabled,
+                "record_failed_attempts": request.record_failed_attempts,
+                "epoch_index": request.epoch_index,
+                "phase": request.phase,
+                "max_steps": request.max_steps,
+                "max_backtests_per_fold": request.max_backtests,
+                "deadline_seconds": request.deadline_seconds,
+                "finalize_before_deadline_seconds": request.finalize_before_deadline_seconds,
+                "sandbox_spec": sandbox_spec.to_record(),
+                "taste_prompt": request.taste,
+                "fold_exploration_directive": self.fold_exploration_directive.strip(),
+                "budgets": {
+                    "max_steps": request.max_steps,
+                    "max_backtests": request.max_backtests,
+                    "max_llm_calls": request.max_llm_calls,
+                    "deadline_seconds": request.deadline_seconds,
+                },
+            },
+        )
+        workspace_root = paths.workspace
+        output_dir = workspace_root / "output"
+        models_dir = workspace_root / "models"
+        inputs_dir = workspace_root / "inputs"
+        source = request.parent.path if request.parent is not None else self.baseline_strategy.parent
+        source_models = request.parent.model_path if request.parent is not None else None
+        if request.parent is None and self.baseline_strategy.name != "main.py":
+            raise ValueError("baseline strategy file must be named main.py for Fold development")
+        copy_artifact(source, output_dir)
+        copy_model_artifacts(source_models, models_dir)
+        restore_working_artifacts_writable(output_dir, models_dir)
+        inputs_dir.mkdir()
+        # Fold sessions never see frozen Test metrics: only the meta session is
+        # allowed that adaptive feedback (docs/pipeline-design.md §3.2).
+        history = [
+            compact_fold_history(record)
+            for record in latest_fold_records(self.ledger.read()).values()
+        ]
+        _environment_phase(request.progress_hook, "pit_view", request.run_id)
+        self._install_snapshot_view(
+            local,
+            request,
+            start=request.fold.input_window_start,
+            end=request.fold.validation_end,
+        )
+        safe = SafeWorkspace(workspace_root)
+        # Read-only exploration reaches the PIT views, the inherited parent
+        # artifacts, the backtest results and the step lineage, not just the
+        # writable workspace.
+        search_roots = SearchRoots(safe, paths=paths)
+        tree = self._install_step_tree(paths, request.parent)
+        sandbox: DockerSandbox | None = None
+        try:
+            if self.command_runner_factory is not None:
+                command_runner = self.command_runner_factory(workspace_root)
+            else:
+                _environment_phase(request.progress_hook, "sandbox_start", request.run_id)
+                sandbox = DockerSandbox(
+                    local,
+                    sandbox_spec,
+                    labels={"adm.experiment": request.experiment_id, "adm.run": request.run_id},
+                )
+                sandbox.start()
+                command_runner = PersistentCommandRunner(sandbox)
+            # Built once, after the runtime env and the data summary exist, so
+            # the prompt and the workspace copy state the same facts.
+            facts = self._fold_facts(
+                request,
+                history,
+                manifest=manifest,
+                paths=paths,
+                models_dir=models_dir,
+            )
+            write_json_atomic(inputs_dir / "fold_context.json", facts)
+            chmod_tree(inputs_dir, file_mode=0o444, dir_mode=0o555)
+
+            @contextmanager
+            def formal_guard():
+                guard = sandbox.formal_guard() if sandbox is not None else nullcontext()
+                with guard:
+                    local.lock_agent_output()
+                    chmod_tree(output_dir, file_mode=0o444, dir_mode=0o555)
+                    chmod_tree(models_dir, file_mode=0o444, dir_mode=0o555)
+                    try:
+                        yield
+                    finally:
+                        restore_working_artifacts_writable(output_dir, models_dir)
+                        local.unlock_agent_output()
+
+            modification = ModificationCheckTool(
+                output_dir,
+                parent_dir=source,
+                models_dir=models_dir,
+                parent_models_dir=source_models,
+                constraints=request.modification_constraints,
+            )
+            time_budget = InferenceTimeBudget(
+                duration_seconds=request.deadline_seconds
+            )
+            shared_budget = SessionCallBudget(
+                max_calls=request.max_llm_calls,
+                time_budget=time_budget,
+            )
+            backtest = FoldBacktestTool(
+                request=request,
+                output_dir=output_dir,
+                models_dir=models_dir,
+                modification_check=modification,
+                artifact_store=self.artifact_store,
+                evaluator=self.evaluator,
+                tree=tree,
+                schedule=self.schedule,
+                broker_profile=self.broker_profile,
+                time_budget=time_budget,
+                formal_guard=formal_guard,
+                manifest=manifest,
+            )
+            tools: list[Tool] = [
+                ReadFileTool(search_roots),
+                GrepTool(search_roots),
+                GlobTool(search_roots),
+                WriteFileTool(safe),
+                EditFileTool(safe),
+                SandboxShellTool(safe, command_runner),
+                StrategyValidationTool(safe),
+                modification,
+                backtest,
+            ]
+            if self.step_tree_enabled:
+                tools.append(StepRollbackTool(tree, output_dir, models_dir))
+            if request.user_question_hook is not None:
+                tools.append(
+                    AskUserTool(request.user_question_hook, time_budget=time_budget)
+                )
+            # Matches the opaque fold ref the step tree stores, so the
+            # current-session check compares like with like.
+            tools.append(
+                FinishFoldTool(
+                    tree,
+                    fold_id=agent_visible_ref(request.fold.fold_id, prefix="fold_ref"),
+                    run_id=request.run_id,
+                )
+            )
+            budgeted = SessionBudgetLLM(self.llm, budget=shared_budget)
+            explore_budgeted = SessionBudgetLLM(
+                self.explore_llm,
+                budget=shared_budget,
+            )
+            compact_budgeted = (
+                SessionBudgetLLM(self.compact_llm, budget=shared_budget)
+                if self.compact_llm is not None
+                else None
+            )
+            explore_tools = ToolRegistry(
+                [
+                    ReadFileTool(search_roots),
+                    GrepTool(search_roots),
+                    GlobTool(search_roots),
+                    ReadOnlyShellTool(safe, command_runner),
+                    StrategyValidationTool(safe),
+                ]
+            )
+            explore = ExploreSubAgentEngine(
+                llm=explore_budgeted,
+                tools=explore_tools,
+                config=ExploreSubAgentConfig(max_tokens=self.explore_max_tokens),
+                time_budget=time_budget,
+            )
+            runner = AgentSessionRunner(
+                llm=budgeted,
+                tools=ToolRegistry(tools),
+                system_prompt=build_system_prompt(
+                    self.schedule,
+                    mode="fold",
+                    experiment_facts=facts,
+                    phase=request.phase,
+                    step_tree_enabled=self.step_tree_enabled,
+                    taste_prompt=request.taste,
+                    fold_exploration_directive=self.fold_exploration_directive,
+                    fold_directive=request.directive,
+                ),
+                config=AgentSessionConfig(
+                    mode="fold",
+                    finalize_before_deadline_seconds=(
+                        request.finalize_before_deadline_seconds
+                    ),
+                    max_llm_calls=request.max_llm_calls,
+                    deadline_seconds=request.deadline_seconds,
+                    max_response_tokens=self.max_response_tokens,
+                ),
+                compactor=(
+                    ContextCompactor(compact_budgeted, self.context_compaction)
+                    if compact_budgeted is not None
+                    else None
+                ),
+                explore=explore,
+                time_budget=time_budget,
+                event_sink=_agent_event_sink(trace, request.progress_hook, request.run_id),
+            )
+            result = runner.run(self._fold_instruction(request))
+            selected_node = str(result.finish_value.get("node_id") or "")
+            selected_revision = str(result.finish_value.get("revision_id") or "")
+            if not selected_node or not selected_revision:
+                raise RuntimeError("Fold Agent did not select a validated revision")
+            steps = tuple(
+                StepResult(
+                    step.step_id,
+                    step.revision_id,
+                    step.validation,
+                    selected=step.step_id == selected_node,
+                )
+                for step in backtest.steps
+            )
+            if selected_revision not in {step.revision_id for step in steps}:
+                raise RuntimeError("finish_fold selected a revision absent from this Fold result")
+            manifest.update(conversation_id=result.conversation_id, selected_step_id=selected_node)
+            if self.step_tree_enabled and paths.steps.exists():
+                link_copytree(paths.steps, self.experiment_dir / "steps")
+            collected = local.collect_artifacts(
+                self.artifact_store.root.parent / request.run_id
+            )
+            return FoldSessionResult(
+                result.conversation_id,
+                steps,
+                selected_node,
+                "llm_agent_finish_fold",
+                # The collected copy, not the live sandbox tree: the fold ledger
+                # record carries it so a later Meta session can still read this
+                # run's backtest summaries after the sandbox is cleaned up.
+                run_manifest_ref=str(collected / "run_manifest.json"),
+            )
+        except Exception as exc:
+            trace.emit(
+                "session_error",
+                {"status": "error", "error": f"{type(exc).__name__}: {exc}"},
+            )
+            raise
+        finally:
+            if sandbox is not None:
+                sandbox.stop()
+
+    def _install_step_tree(self, paths, parent) -> StepTree:
+        """Hand the experiment-level step tree to the fold and mark the start node.
+
+        With the step tree disabled the fold still records its own run nodes —
+        ``finish_fold`` selects one of them — but the lineage is not inherited
+        from earlier folds and is not published back, so the ablation removes
+        the cross-fold memory the knob is about.
+        """
+        experiment_tree = self.experiment_dir / "steps"
+        if self.step_tree_enabled and experiment_tree.exists():
+            link_copytree(experiment_tree, paths.steps)
+        tree = StepTree(paths.steps)
+        if self.step_tree_enabled:
+            tree.set_position(tree.position_for_step(parent.source_step_id) if parent else None)
+        return tree
+
+    def _install_snapshot_view(
+        self,
+        local: LocalSandbox,
+        request: FoldSessionRequest,
+        *,
+        start: str,
+        end: str,
+    ) -> None:
+        source = Path(request.snapshot.decision_ref).resolve(strict=True)
+        target = local.paths.current_snapshot
+        if source.is_dir():
+            local.bind_snapshot_view(source)
+        elif source.is_file():
+            frame_between = getattr(self.evaluator, "frame_between", None)
+            if not callable(frame_between):
+                raise TypeError("file-backed snapshot requires an evaluator with frame_between")
+            visible = frame_between(start, end)
+            if not isinstance(visible, pd.DataFrame) or visible.empty:
+                raise ValueError(f"Agent daily view is empty for {start}..{end}")
+            target.mkdir(parents=True, exist_ok=True)
+            visible.to_parquet(target / "daily.parquet", index=False)
+            write_json_atomic(
+                target / "manifest.json",
+                {
+                    "snapshot_id": request.snapshot.snapshot_id,
+                    "kind": "local_daily",
+                    "period_start": _date_key(start),
+                    "period_end": _date_key(end),
+                },
+            )
+            chmod_tree(target, file_mode=0o444, dir_mode=0o555)
+        else:  # pragma: no cover - resolve(strict=True) already rejects this
+            raise ValueError(f"snapshot decision_ref is neither a file nor directory: {source}")
+        write_agent_data_summary(
+            local.paths.data_summary,
+            kind="fold",
+            # Agent-visible: opaque the fold id so the calendar period (e.g.
+            # 2022Q1) cannot leak through data_summary.json. Host correlation
+            # uses run_id. Same projection as the ledger and step-tree views.
+            fold_id=agent_visible_ref(request.fold.fold_id, prefix="fold_ref"),
+            views={"snapshot": (target, "/mnt/snapshot")},
+        )
+        local.paths.data_summary.chmod(0o444)
+
+    def _fold_facts(
+        self,
+        request: FoldSessionRequest,
+        history: list[dict[str, object]],
+        *,
+        manifest: RunManifest,
+        paths,
+        models_dir: Path,
+    ) -> dict[str, object]:
+        """The Agent-visible operational-facts block for this Fold session.
+
+        ``build_experiment_facts`` is the single visibility contract: it reads
+        the run manifest, the runtime env and the data summary and projects the
+        raw fold id through ``agent_visible_ref``. The Fold-side development
+        history rides alongside it — the only cross-fold evidence a Fold
+        session gets besides the step tree.
+        """
+        return {
+            **build_experiment_facts(
+                manifest=dict(manifest.data),
+                runtime_env=_read_json_if_exists(paths.runtime_env),
+                data_summary=_read_json_if_exists(paths.data_summary),
+                max_llm_calls=request.max_llm_calls,
+                context_compaction={
+                    "enabled": self.compact_llm is not None,
+                    "token_threshold": self.context_compaction.token_threshold,
+                    "max_calls": self.context_compaction.max_calls,
+                },
+                model_artifacts_empty=(
+                    not any(models_dir.iterdir()) if models_dir.exists() else True
+                ),
+            ),
+            "development_history": history,
+            "workspace": {
+                "strategy": "output/main.py",
+                "models": "models/",
+                "fold_context": "inputs/fold_context.json",
+                "data_summary": "/mnt/artifacts/data_summary.json",
+                "snapshot_in_sandbox": "/mnt/snapshot",
+            },
+            "forbidden": ["current_test", "future_data", "heldout", "external_network", "host_control"],
+        }
+
+    @staticmethod
+    def _fold_instruction(request: FoldSessionRequest) -> str:
+        # The researcher's per-Fold directive is a system-prompt section
+        # (build_fold_directive_section), not an instruction suffix: it must
+        # carry the framing and precedence rules every session sees, and must
+        # not be re-stated in the user turn.
+        return (
+            request.prompt_override.strip()
+            or "Inspect the parent strategy, make one evidence-backed daily JSON strategy improvement, call modification_check and daily_backtest, then select a complete current-run Step with finish_fold."
+        )
+
+
+class LLMMetaLearner:
+    """Offline Meta adapter that delegates the session to ``MetaLearningAgent``."""
+
+    def __init__(
+        self,
+        *,
+        llm: LLMProxy,
+        compact_llm: LLMProxy | None = None,
+        context_compaction: ContextCompactionConfig | None = None,
+        baseline_strategy: str | Path,
+        artifact_store: FilesystemArtifactStore,
+        experiment_dir: str | Path,
+        runtime_root: str | Path,
+        max_llm_calls: int,
+        deadline_seconds: float,
+        max_response_tokens: int = 8_000,
+        meta_learning_directive: str = "",
+        fold_exploration_directive: str = "",
+        regularization_constraints: ModificationConstraints | None = None,
+        sandbox_spec: SandboxSpec | None = None,
+        use_docker: bool = True,
+        rebuild_enabled: bool = True,
+        rebuild_timeout_seconds: int = 1800,
+        image_keep: int = 3,
+        sandbox_spec_sink: Callable[[SandboxSpec], None] | None = None,
+    ) -> None:
+        self.llm = llm
+        self.compact_llm = compact_llm
+        self.context_compaction = context_compaction or ContextCompactionConfig()
+        self.baseline_strategy = Path(baseline_strategy).resolve(strict=True)
+        self.artifact_store = artifact_store
+        self.experiment_dir = Path(experiment_dir).resolve()
+        self.runtime_root = Path(runtime_root).resolve()
+        self.max_llm_calls = max_llm_calls
+        self.deadline_seconds = deadline_seconds
+        # Derived-image rebuild: a Meta session may declare stable dependencies
+        # that later ordinary Folds inherit. The new tag reaches those folds
+        # through ``sandbox_spec_sink``.
+        self.sandbox_spec = sandbox_spec or SandboxSpec()
+        self.use_docker = use_docker
+        self.rebuild_enabled = rebuild_enabled
+        self.rebuild_timeout_seconds = rebuild_timeout_seconds
+        self.image_keep = image_keep
+        self.sandbox_spec_sink = sandbox_spec_sink
+        self.max_response_tokens = max_response_tokens
+        self.meta_learning_directive = meta_learning_directive
+        self.fold_exploration_directive = fold_exploration_directive
+        # The limits a Meta regularization must satisfy before the Pipeline will
+        # freeze it; published in the run manifest and enforced by the check.
+        self.regularization_constraints = regularization_constraints or ModificationConstraints()
+
+    def __call__(self, facts: dict[str, object]) -> MetaSessionResult:
+        from autotrade.agent.compact import ContextCompactor
+        from autotrade.agent.prompts import (
+            build_meta_learning_prompt,
+            build_system_prompt,
+        )
+        from autotrade.agent.runner import (
+            AgentSessionConfig,
+            AgentSessionRunner,
+            MetaLearningAgent,
+            TasteFinishTool,
+            visible_window_dates,
+        )
+
+        run_id = str(facts.get("run_id") or f"meta_{uuid.uuid4().hex}")
+        root = self.runtime_root / run_id
+        if root.exists():
+            raise FileExistsError(f"Meta runtime already exists: {run_id}")
+        experiment_id = str(facts.get("experiment_id") or "")
+        epoch_id = str(facts.get("epoch_id") or "")
+        session_id = str(facts.get("meta_learning_id") or "")
+        progress_hook = facts.get("progress_hook")
+        if progress_hook is not None and not callable(progress_hook):
+            raise TypeError("progress_hook must be callable")
+        trace = AgentTraceWriter(
+            agent_trace_path(self.artifact_store.root.parent, run_id),
+            ids={
+                "experiment_id": experiment_id,
+                "epoch_id": epoch_id,
+                "fold_id": agent_visible_ref(session_id, prefix="fold_ref"),
+                "run_id": run_id,
+                "session_kind": "meta_learning",
+            },
+        )
+        _environment_phase(progress_hook, "sandbox_layout", run_id)
+        local = LocalSandbox(root)
+        paths = local.prepare_layout()
+        # Only a Meta session may declare new sandbox dependencies, so only a
+        # Meta workspace carries the request format example.
+        write_sandbox_environment_example(paths.workspace)
+        safe = SafeWorkspace(paths.workspace)
+        search_roots = SearchRoots(safe, paths=paths)
+        inputs = paths.workspace / "inputs"
+        inputs.mkdir()
+        parent_id = str(facts.get("parent_artifact_id") or "")
+        if parent_id:
+            if Path(parent_id).name != parent_id or parent_id.startswith("."):
+                raise ValueError("parent_artifact_id must be one local path component")
+            parent_root = (self.artifact_store.frozen_root / parent_id).resolve(strict=True)
+            if not parent_root.is_relative_to(self.artifact_store.frozen_root):
+                raise ValueError("parent artifact escaped the configured store")
+            parent = (parent_root / "output").resolve(strict=True)
+            parent_models = parent_root / "models"
+            parent_models = parent_models if parent_models.is_dir() else None
+        else:
+            parent = self.baseline_strategy.parent
+            parent_models = None
+        # The parent is the Meta session's WORKING copy, not a read-only input:
+        # a Meta session may regularize the strategy artifact within
+        # regularization_constraints, and the Pipeline freezes the result.
+        output_dir = paths.workspace / "output"
+        models_dir = paths.workspace / "models"
+        copy_artifact(parent, output_dir)
+        copy_model_artifacts(parent_models, models_dir)
+        restore_working_artifacts_writable(output_dir, models_dir)
+        public = {
+            key: value
+            for key, value in facts.items()
+            if key not in {"user_question_hook", "progress_hook", "meta_learning_memory"}
+        }
+        write_json_atomic(inputs / "meta_context.json", public)
+        # Raw prior Meta traces, bounded by meta_memory_max_epochs: a JSONL file
+        # rather than a prompt field, because it is line-oriented and can be
+        # long. Empty memory still writes the file so a first Epoch reads an
+        # empty one instead of guessing.
+        memory_path = inputs / "meta_learning_memory.jsonl"
+        memory_path.write_text(str(facts.get("meta_learning_memory") or ""), encoding="utf-8")
+        chmod_tree(inputs, file_mode=0o444, dir_mode=0o555)
+        visible_fold = public.get("visible_fold") if isinstance(public.get("visible_fold"), dict) else {}
+        manifest = RunManifest.create(
+            paths.run_manifest,
+            {
+                "experiment_id": experiment_id,
+                "epoch_id": epoch_id,
+                "meta_learning_id": session_id,
+                "trigger_after_folds": facts.get("trigger_after_folds"),
+                # Raw on the host manifest; both Agent-visible projections apply
+                # agent_visible_ref themselves.
+                "fold_id": session_id,
+                "run_id": run_id,
+                "kind": "meta_learning",
+                "llm": {
+                    "provider": str(getattr(self.llm, "provider", "")),
+                    "model": str(getattr(self.llm, "model", "")),
+                },
+                "runtime_env_ref": "/mnt/artifacts/runtime_env.json",
+                "data_summary_ref": "/mnt/artifacts/data_summary.json",
+                "meta_learning_visible_fold": dict(visible_fold),
+                "valid_decision_time": visible_fold.get("valid_decision_time"),
+                "snapshots": {
+                    "valid_decision_input": {"snapshot_id": facts.get("snapshot_id")},
+                },
+                "parent_strategy_artifact_id": parent_id or None,
+                "template_ref": None if parent_id else "agent_output_template",
+                "is_initial_artifact": not parent_id,
+                # Agent-facing manifest: sandbox mount paths, never host paths.
+                "development_inputs": {
+                    "meta_context": "/mnt/agent/workspace/inputs/meta_context.json",
+                    "meta_learning_memory": "/mnt/agent/workspace/inputs/meta_learning_memory.jsonl",
+                    "strategy_working_copy": "/mnt/agent/workspace/output",
+                    "model_working_copy": "/mnt/agent/workspace/models",
+                    "previous_taste": bool(str(public.get("previous_taste") or "").strip()),
+                },
+                "taste_output": "/mnt/agent/workspace/taste.md",
+                "modification_constraints": replace(
+                    self.regularization_constraints, is_initial_artifact=not parent_id
+                ).to_record(),
+                "meta_learning_directive": self.meta_learning_directive.strip(),
+                "fold_exploration_directive": self.fold_exploration_directive.strip(),
+                "budgets": {
+                    "max_llm_calls": self.max_llm_calls,
+                    "deadline_seconds": self.deadline_seconds,
+                },
+            },
+        )
+        time_budget = InferenceTimeBudget(
+            duration_seconds=self.deadline_seconds
+        )
+        shared_budget = SessionCallBudget(
+            max_calls=self.max_llm_calls,
+            time_budget=time_budget,
+        )
+        budgeted = SessionBudgetLLM(self.llm, budget=shared_budget)
+        compact_budgeted = (
+            SessionBudgetLLM(self.compact_llm, budget=shared_budget)
+            if self.compact_llm is not None
+            else None
+        )
+        modification = ModificationCheckTool(
+            output_dir,
+            parent_dir=parent,
+            models_dir=models_dir,
+            parent_models_dir=parent_models,
+            constraints=replace(
+                self.regularization_constraints, is_initial_artifact=not parent_id
+            ),
+        )
+        tools: list[Tool] = [
+            ReadFileTool(search_roots),
+            GrepTool(search_roots),
+            GlobTool(search_roots),
+            # The Meta session's writable surface: the strategy/model working
+            # copy it may regularize, the Taste, and the optional
+            # sandbox_environment.json dependency request the Pipeline builds
+            # into the image later Folds inherit.
+            WriteFileTool(safe),
+            EditFileTool(safe),
+            WriteTasteTool(safe),
+            modification,
+        ]
+        hook = facts.get("user_question_hook")
+        if hook is not None:
+            if not callable(hook):
+                raise TypeError("user_question_hook must be callable")
+            tools.append(AskUserTool(hook, time_budget=time_budget))
+        # The Taste is injected into every later Fold prompt, so it must not
+        # carry the visible window's calendar dates forward.
+        tools.append(
+            TasteFinishTool(safe, window_dates=visible_window_dates(manifest.data))
+        )
+        instruction = str(public.get("prompt_override") or "").strip() or build_meta_learning_prompt(
+            public.get("development_history") if isinstance(public.get("development_history"), dict) else {},
+            str(public.get("previous_taste") or ""),
+            experiment_directive=self.meta_learning_directive,
+            fold_exploration_directive=self.fold_exploration_directive,
+        )
+        directive = str(public.get("directive") or "").strip()
+        if directive:
+            instruction += f"\n\nSupervising user directive:\n{directive}"
+        runner = AgentSessionRunner(
+            llm=budgeted,
+            tools=ToolRegistry(tools),
+            system_prompt=build_system_prompt(mode="meta", experiment_facts=public),
+            config=AgentSessionConfig(
+                mode="meta",
+                max_llm_calls=self.max_llm_calls,
+                deadline_seconds=self.deadline_seconds,
+                max_response_tokens=self.max_response_tokens,
+            ),
+            compactor=(
+                ContextCompactor(compact_budgeted, self.context_compaction)
+                if compact_budgeted is not None
+                else None
+            ),
+            time_budget=time_budget,
+            event_sink=_agent_event_sink(
+                trace,
+                progress_hook,
+                run_id,
+                include_content=False,
+            ),
+        )
+        try:
+            result = MetaLearningAgent(runner, paths.workspace).learn(instruction)
+            manifest.update(conversation_id=result.get("conversation_id"))
+            # Runs after the session returns, so it is Pipeline finalization
+            # rather than an Agent action: whatever the Meta left in output/ and
+            # models/ must satisfy the regularization constraints before it can
+            # become the next Fold's parent.
+            _environment_phase(progress_hook, "meta_finalize", run_id)
+            check, allowed = _finalize_modification_check(modification)
+            manifest.update(last_modification_check=check)
+            revision_id = ""
+            if parent_id and allowed and _check_has_changes(check):
+                validate_strategy_source(
+                    (output_dir / "main.py").read_text(encoding="utf-8"), filename="main.py"
+                )
+                revision = self.artifact_store.create_revision(output_dir, models_path=models_dir)
+                revision_id = str(revision.revision_id)
+            _environment_phase(progress_hook, "environment_update", run_id)
+            rebuild_error: RuntimeError | None = None
+            try:
+                _update, active_spec = maybe_rebuild_sandbox_image(
+                    paths.workspace / SANDBOX_ENVIRONMENT_REQUEST_NAME,
+                    base_spec=self.sandbox_spec,
+                    experiment_id=experiment_id,
+                    epoch_id=session_id or epoch_id,
+                    experiment_dir=self.experiment_dir,
+                    manifest=manifest,
+                    use_docker=self.use_docker,
+                    rebuild_enabled=self.rebuild_enabled,
+                    timeout_seconds=self.rebuild_timeout_seconds,
+                    image_keep=self.image_keep,
+                )
+            except RuntimeError as exc:
+                rebuild_error = exc
+            else:
+                if active_spec is not self.sandbox_spec and self.sandbox_spec_sink is not None:
+                    self.sandbox_spec_sink(active_spec)
+            # Collect first, then fail: the Taste and the rebuild record must
+            # survive a rebuild failure.
+            local.collect_artifacts(self.artifact_store.root.parent / run_id)
+            if rebuild_error is not None:
+                raise rebuild_error
+            return MetaSessionResult(
+                taste=str(result["taste"]),
+                conversation_id=str(result.get("conversation_id") or ""),
+                revision_id=revision_id,
+                modification_check=check,
+                allowed=allowed,
+            )
+        except Exception as exc:
+            trace.emit(
+                "session_error",
+                {"status": "error", "error": f"{type(exc).__name__}: {exc}"},
+            )
+            raise
+
+
+def _environment_phase(
+    progress_hook,
+    stage: str,
+    run_id: str,
+) -> None:
+    if progress_hook is not None:
+        progress_hook(stage, {"run_id": run_id})
+
+
+def _agent_event_sink(
+    trace: AgentTraceWriter,
+    progress_hook,
+    run_id: str,
+    *,
+    include_content: bool = True,
+):
+    def emit(event_type: str, payload: dict[str, object]) -> None:
+        trace.emit(
+            event_type,
+            payload if include_content else _safe_meta_trace_payload(event_type, payload),
+        )
+        if progress_hook is None:
+            return
+        if event_type == "llm_call_started":
+            stage = "llm_call"
+        elif event_type == "tool_call_started":
+            stage = "backtest" if payload.get("tool") == "daily_backtest" else "tool_call"
+        elif event_type == "session_end":
+            stage = "agent_complete"
+        else:
+            return
+        public = {
+            "run_id": run_id,
+            **{
+                key: payload[key]
+                for key in ("call_index", "tool", "status", "llm_calls", "steps_used")
+                if key in payload
+            },
+        }
+        progress_hook(stage, public)
+
+    return emit
+
+
+def _safe_meta_trace_payload(
+    event_type: str,
+    payload: dict[str, object],
+) -> dict[str, object]:
+    """Keep Meta operations observable without exposing compact Test evidence."""
+
+    allowed = {
+        "session_start": {"mode"},
+        "llm_call_started": {"call_index", "status"},
+        "llm_call": {"call_index", "status", "model", "usage", "tool_names", "error"},
+        "tool_call_started": {"tool", "tool_call_id", "status"},
+        "tool_call": {"call_index", "tool_call_id", "tool"},
+        "session_end": {"status", "llm_calls", "steps_used"},
+    }.get(event_type, {"status", "error"})
+    return {key: value for key, value in payload.items() if key in allowed}
+
+
+def _finalize_modification_check(tool: ModificationCheckTool) -> tuple[dict[str, object], bool]:
+    """Run the post-session check, turning a refusal into an audited verdict.
+
+    A Meta session that leaves the artifact outside its constraints must not
+    fail the whole session — the Taste is still valid — but its edits must be
+    rejected rather than frozen, so the refusal is recorded and reported.
+    """
+    try:
+        result = tool.invoke({})
+    except ToolError as exc:
+        return {"allowed_to_backtest": False, "reasons": [str(exc)]}, False
+    return {"allowed_to_backtest": True, **dict(result.value)}, True
+
+
+def _check_has_changes(check: Mapping[str, object]) -> bool:
+    delta = check.get("delta")
+    model_delta = check.get("model_delta")
+    if not isinstance(delta, Mapping):
+        delta = {}
+    if not isinstance(model_delta, Mapping):
+        model_delta = {}
+    return any(
+        [
+            int(delta.get("changed_file_count") or 0) > 0,
+            int(delta.get("diff_lines") or 0) > 0,
+            int(delta.get("code_diff_lines") or 0) > 0,
+            int(model_delta.get("changed_file_count") or 0) > 0,
+        ]
+    )
+
+
+def _read_json_if_exists(path: Path) -> dict[str, object]:
+    try:
+        if not path.exists():
+            return {}
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _date_key(value: object) -> str:
+    return pd.Timestamp(str(value)).strftime("%Y%m%d")
+
+
+__all__ = [
+    "DeterministicBaselineDeveloper",
+    "FilesystemArtifactStore",
+    "LLMFoldDeveloper",
+    "LLMMetaLearner",
+    "LocalDailyEvaluationBackend",
+    "LocalDailySnapshotProvider",
+    "SessionBudgetLLM",
+    "SessionCallBudget",
+]

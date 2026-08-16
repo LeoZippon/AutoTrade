@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autotrade"
+version = "0.1.0"
+description = "Scheduled PIT strategy research and local review."
+requires-python = ">=3.11"
+dependencies = [
+  "duckdb==1.1.3",
+  "matplotlib==3.11.0",
+  "numpy==2.1.3",
+  "pandas==2.2.3",
+  "pyarrow==18.1.0",
+  "tushare==1.4.29",
+]
+
+[project.optional-dependencies]
+# Console/WebUI service deps: `pip install -e '.[webui]'`
+webui = [
+  "fastapi==0.139.0",
+  "uvicorn==0.50.2",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+extend-exclude = ["external_references"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = [
+  # Dependency-owned deprecation emitted at fastapi/testclient import time; revisit when fastapi/starlette are next bumped.
+  "ignore:Using `httpx` with `starlette\\.testclient` is deprecated:starlette.exceptions.StarletteDeprecationWarning",
+]

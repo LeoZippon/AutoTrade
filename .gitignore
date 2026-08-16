@@ -1,0 +1,54 @@
+# Runtime outputs and local experiment artifacts
+/logs/
+/data/
+/results/
+/wandb/
+/artifacts/
+/reports/
+/.runtime/
+/experiments/
+/MacroQuantCore/
+AGENTS.md
+CLAUDE.md
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
+
+# Local environments and secrets
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+env/
+
+# Notebook and editor state
+.ipynb_checkpoints/
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Vendored references (not part of the repo)
+/external_references/
+
+# Local agent workspace and worktrees
+/.pi/
+/.worktrees/
+
+# Docs and logbook stay local
+/docs/
+/LOGBOOK.md
+.mutagenignore

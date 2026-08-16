@@ -1,0 +1,553 @@
+"""Experiment configuration: acceptance semantics, validation, defaults drift.
+
+The three default surfaces — the domain dataclasses, ``hitl_state``'s console
+defaults, and the ``run_experiment`` CLI — must agree; the dataclasses are the
+source of truth. Nothing else prevents a knob from meaning one thing in the
+console and another on the command line.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import unittest
+from dataclasses import MISSING, fields
+from pathlib import Path
+from unittest.mock import patch
+
+from autotrade.environment.broker import BrokerProfile
+from autotrade.environment.strategy import StrategySchedule
+from autotrade.pipelines.config import AcceptanceRules, RollingExperimentConfig
+from autotrade.pipelines.hitl_state import WEB_CREATE_DEFAULTS
+
+#: The console create form is seeded from a real launch configuration rather
+#: than from the library fallbacks. These sixteen keys are where the two differ.
+_CONSOLE_CREATE_PRESET: dict[str, object] = {
+    "compact_keep_recent_messages": 10,
+    "compact_max_calls": 10,
+    "compact_max_tokens": 10_000,
+    "compact_token_threshold": 200_000,
+    "first_test_period": "2024Q2",
+    "last_test_period": "2025Q4",
+    "heldout_first_period": "2026Q1",
+    "heldout_last_period": "2026Q2",
+    "initial_cash": 100_000,
+    "initial_control_mode": "auto",
+    "max_steps_per_fold": 20,
+    "meta_learning_fold_interval": 1,
+    "meta_model": "qwen3.8-27b-local",
+    "model": "qwen3.8-27b-local",
+    "screen_boards": ("main",),
+    "screen_exclude_new_listed_days": 180,
+    "screen_exclude_st": True,
+}
+
+PERIODS = {
+    "first_test_period": "2022Q1",
+    "last_test_period": "2022Q2",
+    "heldout_first_period": "2023Q1",
+    "heldout_last_period": "2023Q1",
+}
+
+
+def make_config(root: Path, **overrides: object) -> RollingExperimentConfig:
+    values: dict[str, object] = {
+        "experiment_id": "exp",
+        "experiments_root": root / "experiments",
+        **PERIODS,
+    }
+    values.update(overrides)
+    return RollingExperimentConfig(**values)
+
+
+class AcceptanceRulesTest(unittest.TestCase):
+    def test_nan_metrics_are_hard_rejects(self) -> None:
+        # NaN compares False against every threshold; without the finiteness
+        # guard a NaN total_return would pass acceptance outright.
+        rules = AcceptanceRules()
+        summary = {"total_return": math.nan, "sharpe": 1.0, "max_drawdown": 0.1}
+        hard, warnings = rules.evaluate(summary, complete=True)
+        self.assertIn("non_finite_total_return", hard)
+        # The finite Sharpe is above target, so nothing may claim otherwise.
+        self.assertNotIn("sharpe_below_target", warnings)
+        for key in ("sharpe", "max_drawdown"):
+            with self.subTest(key=key):
+                broken = {**summary, "total_return": 0.02, key: math.inf}
+                self.assertIn(
+                    f"non_finite_{key}", rules.evaluate(broken, complete=True)[0]
+                )
+        # A boolean is not a metric, however happily it compares.
+        self.assertIn(
+            "non_finite_total_return",
+            rules.evaluate({**summary, "total_return": True}, complete=True)[0],
+        )
+
+    def test_finite_metrics_keep_threshold_semantics(self) -> None:
+        rules = AcceptanceRules()
+        ok = {"total_return": 0.02, "sharpe": 0.5, "max_drawdown": 0.1}
+        self.assertEqual(rules.evaluate(ok, complete=True), ([], []))
+        # Drawdown breach stays a HARD reject (risk limit), sign-independent.
+        for drawdown in (0.30, -0.30):
+            with self.subTest(drawdown=drawdown):
+                hard, _ = rules.evaluate(
+                    {**ok, "max_drawdown": drawdown}, complete=True
+                )
+                self.assertIn("max_drawdown_exceeded", hard)
+        # Return/Sharpe shortfalls only WARN: the fold freezes instead of resetting.
+        hard, warnings = rules.evaluate(
+            {"total_return": -0.01, "sharpe": -0.2, "max_drawdown": 0.1}, complete=True
+        )
+        self.assertEqual(hard, [])
+        self.assertEqual(warnings, ["return_below_target", "sharpe_below_target"])
+
+    def test_incomplete_validation_is_a_hard_reject(self) -> None:
+        rules = AcceptanceRules()
+        ok = {"total_return": 0.02, "sharpe": 0.5, "max_drawdown": 0.1}
+        hard, _ = rules.evaluate(ok, complete=False)
+        self.assertIn("incomplete_validation", hard)
+
+    def test_absent_sharpe_is_not_an_integrity_failure(self) -> None:
+        rules = AcceptanceRules()
+        hard, warnings = rules.evaluate(
+            {"total_return": 0.02, "max_drawdown": 0.1}, complete=True
+        )
+        self.assertEqual(hard, [])
+        self.assertEqual(warnings, [])
+
+    def test_rule_values_must_be_finite_and_ranged(self) -> None:
+        for kwargs in (
+            {"min_return": math.nan},
+            {"min_sharpe": math.inf},
+            {"max_drawdown": math.nan},
+            {"max_drawdown": 1.5},
+            {"max_drawdown": -0.1},
+        ):
+            with self.subTest(**kwargs), self.assertRaises(ValueError):
+                AcceptanceRules(**kwargs)
+
+    def test_record_round_trips_the_three_thresholds(self) -> None:
+        rules = AcceptanceRules(min_return=0.01, min_sharpe=0.2, max_drawdown=0.3)
+        self.assertEqual(
+            rules.to_record(),
+            {"min_return": 0.01, "min_sharpe": 0.2, "max_drawdown": 0.3},
+        )
+
+
+class RollingExperimentConfigValidationTest(unittest.TestCase):
+    def test_valid_defaults_pass(self) -> None:
+        config = make_config(Path("/tmp"))
+        self.assertEqual(config.first_test_period, "2022Q1")
+        self.assertEqual(config.meta_learning_fold_interval, 0)
+        self.assertEqual(config.fold_exploration_directive, "")
+        self.assertEqual(config.max_fold_minutes, 240)
+        self.assertEqual(config.experiment_dir, Path("/tmp/experiments/exp"))
+        self.assertEqual(
+            config.ledger_path,
+            Path("/tmp/experiments/exp/ledgers/experiment_ledger.jsonl"),
+        )
+
+    def test_positive_int_knobs_reject_zero_negatives_floats_and_booleans(self) -> None:
+        for name in (
+            "epochs",
+            "window_months",
+            "min_region_trade_days",
+            "max_steps_per_fold",
+            "max_backtests_per_fold",
+            "max_llm_calls",
+            "max_fold_minutes",
+        ):
+            for value in (0, -1, 1.5, True, math.nan):
+                with self.subTest(field=name, value=value):
+                    with self.assertRaisesRegex(
+                        ValueError, f"{name} must be a positive integer"
+                    ):
+                        make_config(Path("/tmp"), **{name: value})
+
+    def test_non_negative_int_knobs_accept_zero_but_not_negatives(self) -> None:
+        for name in ("meta_learning_fold_interval", "meta_memory_max_epochs"):
+            self.assertEqual(getattr(make_config(Path("/tmp"), **{name: 0}), name), 0)
+            for value in (-1, 1.5, True, math.inf):
+                with self.subTest(field=name, value=value):
+                    with self.assertRaisesRegex(
+                        ValueError, f"{name} must be a non-negative integer"
+                    ):
+                        make_config(Path("/tmp"), **{name: value})
+
+    def test_experiment_id_must_be_a_safe_path_component(self) -> None:
+        for experiment_id in ("../escape", "with space", "sub/dir", "", "dot.name"):
+            with self.subTest(experiment_id=experiment_id):
+                with self.assertRaisesRegex(ValueError, "experiment_id"):
+                    make_config(Path("/tmp"), experiment_id=experiment_id)
+
+    def test_development_and_heldout_windows_must_not_overlap(self) -> None:
+        # The held-out window is pre-registered and must stay strictly after the
+        # last development test period; an overlap silently trains on held-out.
+        with self.assertRaises(ValueError):
+            make_config(
+                Path("/tmp"),
+                last_test_period="2023Q1",
+                heldout_first_period="2023Q1",
+                heldout_last_period="2023Q2",
+            )
+
+
+class DefaultsDriftTest(unittest.TestCase):
+    """The console defaults, the domain dataclasses and the CLI must agree.
+
+    Three keys are a deliberate exception: the console create form seeds the
+    research preset the owner launches from, while the dataclass and the
+    headless CLI keep the conservative library fallback. They are pinned on
+    BOTH sides below rather than skipped, so a further drift — in either
+    direction, on any of the three — still fails.
+    """
+
+    #: key -> (console create default, domain-dataclass default)
+    CONSOLE_PRESET_DIVERGENCE = {
+        "max_steps_per_fold": (20, 10),
+        "meta_learning_fold_interval": (1, 0),
+        "initial_cash": (100_000, 1_000_000.0),
+    }
+
+    def test_console_defaults_match_the_domain_dataclasses(self) -> None:
+        for field_obj in fields(RollingExperimentConfig):
+            if (
+                field_obj.name not in WEB_CREATE_DEFAULTS
+                or field_obj.default is MISSING
+            ):
+                continue
+            if field_obj.name in self.CONSOLE_PRESET_DIVERGENCE:
+                self.assertEqual(
+                    (WEB_CREATE_DEFAULTS[field_obj.name], field_obj.default),
+                    self.CONSOLE_PRESET_DIVERGENCE[field_obj.name],
+                    field_obj.name,
+                )
+                continue
+            self.assertEqual(
+                WEB_CREATE_DEFAULTS[field_obj.name], field_obj.default, field_obj.name
+            )
+        profile = BrokerProfile()
+        for key in ("initial_cash", "commission_bps", "slippage_bps"):
+            if key not in WEB_CREATE_DEFAULTS:
+                continue
+            if key in self.CONSOLE_PRESET_DIVERGENCE:
+                self.assertEqual(
+                    (WEB_CREATE_DEFAULTS[key], getattr(profile, key)),
+                    self.CONSOLE_PRESET_DIVERGENCE[key],
+                    key,
+                )
+                continue
+            self.assertEqual(WEB_CREATE_DEFAULTS[key], getattr(profile, key), key)
+        rules = AcceptanceRules()
+        for key in ("min_return", "min_sharpe", "max_drawdown"):
+            self.assertEqual(WEB_CREATE_DEFAULTS[key], getattr(rules, key), key)
+        schedule = StrategySchedule()
+        self.assertEqual(WEB_CREATE_DEFAULTS["strategy_period"], schedule.period)
+        self.assertEqual(WEB_CREATE_DEFAULTS["inference_time"], schedule.inference_time)
+
+    def test_the_console_create_form_is_seeded_with_the_research_preset(self) -> None:
+        """The create defaults the owner set from a real launch.
+
+        Pinned individually because they are the values a researcher gets
+        without touching the form; a silent revert to the library fallbacks
+        would change every new experiment and nothing else would notice.
+        """
+        self.assertEqual(
+            {key: WEB_CREATE_DEFAULTS[key] for key in sorted(_CONSOLE_CREATE_PRESET)},
+            dict(sorted(_CONSOLE_CREATE_PRESET.items())),
+        )
+        # The identity of an experiment is never pre-filled from the preset.
+        self.assertIsNone(WEB_CREATE_DEFAULTS["experiment_id"])
+
+    def test_the_parameter_schema_holds_no_second_copy_of_the_defaults(self) -> None:
+        """`params_schema` renders `WEB_CREATE_DEFAULTS`, it does not restate it.
+
+        Two tables would drift: the form would offer one value and the worker
+        would be configured with another. Proved by moving the console table
+        and watching every rendered default move with it.
+        """
+        from autotrade.webui.params_schema import parameter_schema
+
+        def rendered() -> dict[str, object]:
+            schema = parameter_schema()
+            return {
+                field["key"]: field["default"]
+                for group in schema["groups"]
+                for field in group["fields"]
+            }
+
+        baseline = rendered()
+        self.assertEqual(
+            baseline,
+            {
+                key: (list(value) if isinstance(value, tuple) else value)
+                for key, value in WEB_CREATE_DEFAULTS.items()
+                if key in baseline
+            },
+        )
+        moved = {
+            "model": "deepseek-v4-pro",
+            "max_steps_per_fold": 7,
+            "screen_boards": ("gem", "star"),
+            "first_test_period": "2019Q3",
+        }
+        with patch.dict(WEB_CREATE_DEFAULTS, moved):
+            after = rendered()
+        self.assertEqual(after["model"], "deepseek-v4-pro")
+        self.assertEqual(after["max_steps_per_fold"], 7)
+        self.assertEqual(after["screen_boards"], ["gem", "star"])
+        self.assertEqual(after["first_test_period"], "2019Q3")
+        self.assertEqual(rendered(), baseline, "the schema retained a mutated default")
+
+    def test_removed_minute_replay_knobs_are_absent_from_every_surface(self) -> None:
+        removed = {
+            "auction_enabled",
+            "auction_preopen_time",
+            "auction_decision_time",
+            "auction_close_time",
+            "execution_lag_bars",
+            "intraday_decision_minutes",
+            "decision_max_sim_minutes",
+            "offsession_tick_minutes",
+            "timeview_enabled",
+            "replay_granularity",
+        }
+        self.assertTrue(
+            removed.isdisjoint(field.name for field in fields(RollingExperimentConfig))
+        )
+        self.assertTrue(removed.isdisjoint(WEB_CREATE_DEFAULTS))
+
+    def test_console_defaults_match_the_parameter_schema(self) -> None:
+        from autotrade.webui.params_schema import parameter_schema
+
+        schema = parameter_schema()
+        for group in schema["groups"]:
+            for field in group["fields"]:
+                key = field["key"]
+                if key not in WEB_CREATE_DEFAULTS or "default" not in field:
+                    continue
+                expected = WEB_CREATE_DEFAULTS[key]
+                actual = field["default"]
+                if isinstance(expected, tuple):
+                    expected = list(expected)
+                if field.get("type") in {"string", "period", "time", "text"}:
+                    # A text field with no console default renders as an empty box.
+                    expected = expected or ""
+                    actual = actual or ""
+                self.assertEqual(actual, expected, key)
+
+    def test_worker_accepts_exactly_the_console_parameters(self) -> None:
+        from autotrade.pipelines.worker import _ALLOWED_PARAMS
+
+        # Every knob the console can write must be one the worker accepts,
+        # otherwise creating an experiment produces a worker that refuses it.
+        unknown = sorted(set(WEB_CREATE_DEFAULTS) - set(_ALLOWED_PARAMS))
+        self.assertEqual(unknown, [])
+
+    def test_cli_defaults_match_the_console_defaults(self) -> None:
+        from scripts.experiments.run_experiment import build_parser
+
+        parser = build_parser()
+        skip = {
+            # Repo-root-resolved path defaults (the console keeps them
+            # repo-relative by design).
+            "raw_dir",
+            "fundamental_events_root",
+            "fundamental_events_status",
+            "experiments_root",
+            "work_root",
+            "template_dir",
+        }
+        mismatches = {}
+        for action in parser._actions:
+            if action.dest not in WEB_CREATE_DEFAULTS or action.dest in skip:
+                continue
+            cli_default = (
+                tuple(action.default)
+                if isinstance(action.default, list)
+                else action.default
+            )
+            expected = WEB_CREATE_DEFAULTS[action.dest]
+            expected = tuple(expected) if isinstance(expected, list) else expected
+            if cli_default != expected:
+                mismatches[action.dest] = (cli_default, expected)
+        # `initial_cash` is the one console-preset divergence that also has a
+        # CLI flag; pinned with both values so a new drift still fails here.
+        self.assertEqual(mismatches, {"initial_cash": (1_000_000.0, 100_000)})
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+RESTORED_CONSOLE_PARAMETERS = (
+    "commission_bps",
+    "slippage_bps",
+    "gpu_count",
+    "nl_failure_policy",
+    "per_call_timeout_seconds",
+    "record_failed_attempts",
+    "finalize_before_deadline_seconds",
+    "convergence_start_epoch",
+    "disable_step_tree",
+    "max_total_holdings",
+    "max_single_name_weight",
+    "disable_meta_sandbox_rebuild",
+    "meta_sandbox_rebuild_timeout_seconds",
+    "meta_sandbox_image_keep",
+)
+
+
+class ConsoleParameterSurfaceTest(unittest.TestCase):
+    """A create-form field must be renderable, submittable and persisted.
+
+    The failure mode is a knob that renders and then 400s on submit, or one the
+    worker silently drops: the console, the worker's accepted set and the
+    on-disk params.json are asserted together.
+    """
+
+    def _schema_fields(self) -> dict:
+        from autotrade.webui.params_schema import parameter_schema
+
+        return {
+            field["key"]: field
+            for group in parameter_schema()["groups"]
+            for field in group["fields"]
+        }
+
+    def test_every_restored_parameter_is_rendered_and_accepted(self) -> None:
+        from autotrade.pipelines.worker import _ALLOWED_PARAMS
+
+        fields = self._schema_fields()
+        for key in RESTORED_CONSOLE_PARAMETERS:
+            with self.subTest(key=key):
+                self.assertIn(key, fields, f"{key} is not rendered on the create form")
+                self.assertIn(key, WEB_CREATE_DEFAULTS, f"{key} has no console default")
+                self.assertIn(key, _ALLOWED_PARAMS, f"the worker would reject {key}")
+                self.assertTrue(fields[key].get("label"))
+                self.assertTrue(fields[key].get("help"), f"{key} has no help text")
+
+    def test_every_rendered_field_is_a_parameter_the_worker_accepts(self) -> None:
+        from autotrade.pipelines.worker import _ALLOWED_PARAMS
+
+        fields = self._schema_fields()
+        # Rendering a field the worker rejects is a control that 400s on submit.
+        unaccepted = sorted(
+            set(fields) - set(_ALLOWED_PARAMS) - {"experiment_id", "inherit_from"}
+        )
+        self.assertEqual(unaccepted, [])
+        # And every rendered field has a default the form can seed from.
+        self.assertEqual(
+            sorted(set(fields) - set(WEB_CREATE_DEFAULTS) - {"experiment_id"}), []
+        )
+
+    def test_the_defaults_match_the_domain_objects_they_configure(self) -> None:
+        from autotrade.environment.broker import BrokerProfile
+
+        profile = BrokerProfile()
+        self.assertEqual(WEB_CREATE_DEFAULTS["commission_bps"], profile.commission_bps)
+        self.assertEqual(WEB_CREATE_DEFAULTS["slippage_bps"], profile.slippage_bps)
+        self.assertEqual(
+            WEB_CREATE_DEFAULTS["max_total_holdings"], profile.max_total_holdings
+        )
+        self.assertEqual(
+            WEB_CREATE_DEFAULTS["max_single_name_weight"],
+            profile.max_single_name_weight,
+        )
+        config = make_config(Path("/tmp"))
+        for key in (
+            "convergence_start_epoch",
+            "record_failed_attempts",
+            "meta_sandbox_rebuild_timeout_seconds",
+            "meta_sandbox_image_keep",
+            "finalize_before_deadline_seconds",
+            "per_call_timeout_seconds",
+        ):
+            with self.subTest(key=key):
+                self.assertEqual(WEB_CREATE_DEFAULTS[key], getattr(config, key), key)
+
+    def test_a_create_request_setting_all_of_them_persists_every_value(self) -> None:
+        import tempfile
+        from unittest.mock import patch
+
+        from fastapi.testclient import TestClient
+
+        from autotrade.webui.manager import ExperimentManager
+        from autotrade.webui.server import create_app
+
+        overrides = {
+            "commission_bps": 2.5,
+            "slippage_bps": 7.5,
+            "gpu_count": 2,
+            "nl_failure_policy": "fail",
+            "per_call_timeout_seconds": 120,
+            "record_failed_attempts": False,
+            "finalize_before_deadline_seconds": 60,
+            "convergence_start_epoch": 2,
+            "disable_step_tree": True,
+            "max_total_holdings": 12,
+            "max_single_name_weight": 0.15,
+            "disable_meta_sandbox_rebuild": True,
+            "meta_sandbox_rebuild_timeout_seconds": 600,
+            "meta_sandbox_image_keep": 1,
+        }
+        self.assertEqual(sorted(overrides), sorted(RESTORED_CONSOLE_PARAMETERS))
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            with patch.object(
+                ExperimentManager, "start_worker", return_value={"spawned": False}
+            ):
+                response = TestClient(create_app(repo_root)).post(
+                    "/api/experiments",
+                    json={
+                        "params": {
+                            "experiment_id": "params_demo",
+                            "first_test_period": "2024Q1",
+                            "last_test_period": "2024Q1",
+                            "heldout_first_period": "2024Q2",
+                            "heldout_last_period": "2024Q2",
+                            **overrides,
+                        }
+                    },
+                )
+            self.assertEqual(response.status_code, 200, response.text)
+            params = json.loads(
+                (repo_root / "experiments/params_demo/hitl/params.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+        for key, value in overrides.items():
+            with self.subTest(key=key):
+                self.assertEqual(params[key], value, key)
+
+
+class WorkerEntryPointTest(unittest.TestCase):
+    def test_the_worker_accepts_and_threads_a_poll_interval(self) -> None:
+        import inspect
+
+        from autotrade.pipelines.worker import run_local_interactive_worker
+
+        signature = inspect.signature(run_local_interactive_worker)
+        self.assertIn("poll_seconds", signature.parameters)
+        self.assertEqual(signature.parameters["poll_seconds"].default, 2.0)
+
+    def test_the_interactive_entry_point_exposes_the_flag(self) -> None:
+        import importlib.util
+
+        repo_root = Path(__file__).resolve().parents[2]
+        spec = importlib.util.spec_from_file_location(
+            "run_interactive_experiment",
+            repo_root / "scripts/experiments/run_interactive_experiment.py",
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        parser = module.build_parser()
+        args = parser.parse_args(
+            ["--experiment-dir", "/tmp/exp", "--poll-seconds", "0.5"]
+        )
+        self.assertEqual(args.poll_seconds, 0.5)
+        # A knob that is accepted and never forwarded is the defect class this
+        # covers: the flag must reach the worker call.
+        source = (
+            repo_root / "scripts/experiments/run_interactive_experiment.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("poll_seconds=", source)
