@@ -420,6 +420,7 @@ class PITDailyEvaluationBackend:
         result_dir = self.results_root / result_id
         result_dir.mkdir(parents=True, exist_ok=False)
         asof_dir = result_dir / "asof"
+        keep_result_dir = False
         frames = _load_replay_frames(replay_dir)
         daily = frames["daily"]
         daily = daily[
@@ -485,47 +486,53 @@ class PITDailyEvaluationBackend:
                 asof_dir=asof_dir,
             )
         try:
-            replay = DailyStrategyPipeline(
-                config,
-                nl_query=nl_service.query,
-                context_data=context_data,
-                execution_price=minute_source.price_at if minute_source is not None else None,
-                executor_factory=executor_factory,
-            ).run(daily)
-            record = replay.to_record()
-        finally:
-            nl_service.close()
-            lock.lock()
-        record["pit"] = {
-            "snapshot_id": request.snapshot.snapshot_id,
-            "generation_id": request.snapshot.generation_id,
-            "decision_ref": str(snapshot_dir),
-            "replay_ref": str(replay_dir),
-            "refresh_calls": len(refreshed),
-            "minute_row_groups_loaded": minute_source.loaded_groups if minute_source is not None else 0,
-            "minute_rows_loaded": minute_source.loaded_rows if minute_source is not None else 0,
-            "minute_max_loaded_partition_rows": (
-                minute_source.max_loaded_partition_rows if minute_source is not None else 0
-            ),
-            "minute_total_rows": minute_source.total_rows if minute_source is not None else 0,
-        }
-        target = result_dir / "result.json"
-        write_json_atomic(target, record)
-        if request.mode == "valid":
-            write_style_rollup(
-                result_dir,
-                replay_style_analysis(
-                    replay,
-                    daily,
-                    replay_dir=replay_dir,
-                    snapshot_dir=snapshot_dir,
-                    mode=request.mode,
+            try:
+                replay = DailyStrategyPipeline(
+                    config,
+                    nl_query=nl_service.query,
+                    context_data=context_data,
+                    execution_price=minute_source.price_at if minute_source is not None else None,
+                    executor_factory=executor_factory,
+                ).run(daily)
+                record = replay.to_record()
+            finally:
+                nl_service.close()
+                lock.lock()
+            record["pit"] = {
+                "snapshot_id": request.snapshot.snapshot_id,
+                "generation_id": request.snapshot.generation_id,
+                "decision_ref": str(snapshot_dir),
+                "replay_ref": str(replay_dir),
+                "refresh_calls": len(refreshed),
+                "minute_row_groups_loaded": minute_source.loaded_groups if minute_source is not None else 0,
+                "minute_rows_loaded": minute_source.loaded_rows if minute_source is not None else 0,
+                "minute_max_loaded_partition_rows": (
+                    minute_source.max_loaded_partition_rows if minute_source is not None else 0
                 ),
-            )
-        summary = record.get("stats")
-        if not isinstance(summary, dict):
-            raise TypeError("daily replay omitted stats")
-        return EvaluationResult(dict(summary), str(target), complete=True)
+                "minute_total_rows": minute_source.total_rows if minute_source is not None else 0,
+            }
+            target = result_dir / "result.json"
+            write_json_atomic(target, record)
+            if request.mode == "valid":
+                write_style_rollup(
+                    result_dir,
+                    replay_style_analysis(
+                        replay,
+                        daily,
+                        replay_dir=replay_dir,
+                        snapshot_dir=snapshot_dir,
+                        mode=request.mode,
+                    ),
+                )
+            summary = record.get("stats")
+            if not isinstance(summary, dict):
+                raise TypeError("daily replay omitted stats")
+            keep_result_dir = True
+            return EvaluationResult(dict(summary), str(target), complete=True)
+        finally:
+            _discard_ephemeral_asof(asof_dir)
+            if not keep_result_dir:
+                shutil.rmtree(result_dir, ignore_errors=True)
 
     @staticmethod
     def _validate_bundle(request: EvaluationRequest, snapshot_dir: Path, replay_dir: Path) -> None:
@@ -631,6 +638,24 @@ class PaperPITData:
     def close(self) -> None:
         self.nl_service.close()
         self._lock.lock()
+
+
+def _discard_ephemeral_asof(asof_dir: Path) -> None:
+    """Drop the per-replay Timeview scratch. Durable evidence is result.json
+    plus the immutable decision/replay refs; keeping asof here copies the
+    text library and minutes into every Validation."""
+
+    if not asof_dir.exists():
+        return
+    try:
+        for path in [asof_dir, *(item for item in asof_dir.rglob("*") if item.is_dir())]:
+            path.chmod(0o755)
+        for path in asof_dir.rglob("*"):
+            if path.is_file() or path.is_symlink():
+                path.chmod(0o644)
+        shutil.rmtree(asof_dir)
+    except OSError as exc:
+        raise RuntimeError(f"cannot discard ephemeral asof view: {asof_dir}: {exc}") from exc
 
 
 class _AsOfReadOnlyView:

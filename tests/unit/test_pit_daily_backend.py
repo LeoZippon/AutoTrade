@@ -210,11 +210,10 @@ def generate_orders(context):
     assert record["pit"]["minute_row_groups_loaded"] == 1
     assert record["pit"]["minute_rows_loaded"] == 1
     assert record["pit"]["minute_max_loaded_partition_rows"] == 1
-    asof = Path(result.result_ref).parent / "asof"
-    assert all(
-        not stat.S_IMODE(path.stat().st_mode) & (stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH)
-        for path in (asof, *asof.rglob("*"))
-    )
+    result_dir = Path(result.result_ref).parent
+    assert (result_dir / "result.json").is_file()
+    assert (result_dir / "style_analysis.json").is_file()
+    assert not (result_dir / "asof").exists()
 
 
 def test_first_month_inference_can_have_empty_bars_with_long_pit_daily_history(
