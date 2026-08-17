@@ -586,8 +586,17 @@ def suggest_period_defaults(options: dict[str, list[str]]) -> dict[str, dict[str
     period as held-out (held-out must follow development without overlap)."""
 
     defaults: dict[str, dict[str, str]] = {}
+    preferred = {
+        "first_test_period": str(WEB_CREATE_DEFAULTS["first_test_period"]),
+        "last_test_period": str(WEB_CREATE_DEFAULTS["last_test_period"]),
+        "heldout_first_period": str(WEB_CREATE_DEFAULTS["heldout_first_period"]),
+        "heldout_last_period": str(WEB_CREATE_DEFAULTS["heldout_last_period"]),
+    }
     for cadence, labels in options.items():
         if len(labels) < 3:
+            continue
+        if cadence == "quarter" and set(preferred.values()).issubset(labels):
+            defaults[cadence] = dict(preferred)
             continue
         defaults[cadence] = {
             "first_test_period": labels[max(1, len(labels) - 1 - DEV_DEFAULT_PERIODS)],

@@ -130,6 +130,7 @@ class RollingExperimentConfig:
     max_steps_per_fold: int = 10
     max_backtests_per_fold: int = 30
     max_llm_calls: int = 400
+    session_max_attempts: int = 3
     max_fold_minutes: int = 240
     # Trailing wrap-up grace handed to the Agent session on top of the main
     # Fold deadline (experiment.py adds it to the session budget; the runner
@@ -196,6 +197,7 @@ class RollingExperimentConfig:
             "max_steps_per_fold",
             "max_backtests_per_fold",
             "max_llm_calls",
+            "session_max_attempts",
             "max_fold_minutes",
             "per_call_timeout_seconds",
             "convergence_start_epoch",

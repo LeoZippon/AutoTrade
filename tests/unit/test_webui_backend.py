@@ -1308,6 +1308,7 @@ class WebuiBackendTest(unittest.TestCase):
         self.assertTrue(all(len(label) == 8 for label in options["week"]))
         defaults = suggest_period_defaults(options)
         quarter = defaults["quarter"]
+        # Calendar ends 2024Q2, so the pinned 2025Q4/2026Q1 preset cannot apply.
         self.assertEqual(quarter["heldout_first_period"], "2024Q2")
         self.assertEqual(quarter["last_test_period"], "2024Q1")
         self.assertLess(quarter["first_test_period"], quarter["last_test_period"])
@@ -1322,6 +1323,16 @@ class WebuiBackendTest(unittest.TestCase):
         }
         self.assertEqual(fields["first_test_period"]["type"], "period")
         self.assertEqual(fields["heldout_first_period"]["default"], "2024Q2")
+
+    def test_quarter_defaults_prefer_the_console_research_window(self) -> None:
+        from autotrade.webui.params_schema import suggest_period_defaults
+
+        labels = [f"{year}Q{quarter}" for year in range(2022, 2027) for quarter in range(1, 5)]
+        defaults = suggest_period_defaults({"quarter": labels})["quarter"]
+        self.assertEqual(defaults["first_test_period"], "2024Q2")
+        self.assertEqual(defaults["last_test_period"], "2025Q4")
+        self.assertEqual(defaults["heldout_first_period"], "2026Q1")
+        self.assertEqual(defaults["heldout_last_period"], "2026Q2")
 
     def test_public_params_never_echo_hidden_keys(self) -> None:
         # The console API refuses HIDDEN_KEYS at creation, but params.json is

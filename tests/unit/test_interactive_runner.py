@@ -144,6 +144,36 @@ class InteractiveRunnerTest(RunnerTestCase):
         # total_sessions reserves the trailing held-out slot the worker runs.
         self.assertEqual(status["total_sessions"], 4)
 
+    def test_a_session_is_retried_after_a_transient_failure(self) -> None:
+        class Flaky(RecordingExecutor):
+            def __call__(self, session, context):
+                if len(self.calls) < 2:
+                    self.calls.append((session.session_key, dict(context)))
+                    raise RuntimeError(f"boom{len(self.calls)}")
+                return super().__call__(session, context)
+
+        executor = Flaky(self.ledger)
+        result = self.runner(
+            sessions_for("fold_a"), executor, session_max_attempts=3
+        ).run()
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(len(executor.calls), 3)
+        self.assertEqual(read_status(self.status)["state"], "development_complete")
+
+    def test_a_session_fails_the_experiment_after_the_attempt_budget(self) -> None:
+        class AlwaysFail(RecordingExecutor):
+            def __call__(self, session, context):
+                self.calls.append((session.session_key, dict(context)))
+                raise RuntimeError("still broken")
+
+        executor = AlwaysFail(self.ledger)
+        with self.assertRaisesRegex(RuntimeError, "still broken"):
+            self.runner(
+                sessions_for("fold_a"), executor, session_max_attempts=3
+            ).run()
+        self.assertEqual(len(executor.calls), 3)
+        self.assertEqual(read_status(self.status)["state"], "failed")
+
     def test_a_positive_poll_interval_is_required(self) -> None:
         for bad in (0, -1.0):
             with self.subTest(poll_seconds=bad), self.assertRaisesRegex(ValueError, "poll_seconds"):

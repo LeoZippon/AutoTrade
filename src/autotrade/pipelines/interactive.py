@@ -65,13 +65,17 @@ class InteractiveExperimentRunner:
         status_path: str | Path,
         poll_seconds: float = 2.0,
         post_fold_hook: Callable[[dict[str, object]], None] | None = None,
+        session_max_attempts: int = 3,
     ) -> None:
         if poll_seconds <= 0:
             raise ValueError("poll_seconds must be positive")
+        if session_max_attempts <= 0:
+            raise ValueError("session_max_attempts must be positive")
         self.experiment_id = experiment_id
         self.sessions = sessions
         self.execute_session = execute_session
         self.post_fold_hook = post_fold_hook
+        self.session_max_attempts = session_max_attempts
         self.ledger = ledger
         self.control_path = Path(control_path)
         self.status = StatusReporter(status_path)
@@ -118,7 +122,7 @@ class InteractiveExperimentRunner:
                     "rerun_id": rerun_id or "",
                 }
                 self._begin_session(session)
-                record = self.execute_session(session, context)
+                record = self._execute_with_retries(session, context)
                 if record is not None:
                     record = {
                         **record,
@@ -154,6 +158,29 @@ class InteractiveExperimentRunner:
             raise
         finally:
             self.status.stop()
+
+    def _execute_with_retries(
+        self, session: DevelopmentSession, context: dict[str, object]
+    ) -> dict[str, object] | None:
+        last_error: Exception | None = None
+        for attempt in range(1, self.session_max_attempts + 1):
+            try:
+                return self.execute_session(session, context)
+            except (ExperimentStopped, AgentSessionDeadlineExceeded):
+                raise
+            except Exception as exc:
+                last_error = exc
+                if attempt >= self.session_max_attempts:
+                    break
+                self.status.set(
+                    environment_stage="session_retry",
+                    error=(
+                        f"{type(exc).__name__}: {exc} "
+                        f"(attempt {attempt}/{self.session_max_attempts})"
+                    ),
+                )
+        assert last_error is not None
+        raise last_error
 
     def _run_post_fold_hook(self, session: DevelopmentSession) -> None:
         """Advisory post-fold strategy analysis: never fatal, always recorded.

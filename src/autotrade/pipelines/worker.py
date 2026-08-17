@@ -119,6 +119,7 @@ _ALLOWED_PARAMS = {
     "max_steps_per_fold",
     "max_backtests_per_fold",
     "max_llm_calls",
+    "session_max_attempts",
     "max_fold_minutes",
     "min_return",
     "min_sharpe",
@@ -506,6 +507,9 @@ def resolve_worker_options(
             params.get("max_backtests_per_fold", 30), "max_backtests_per_fold"
         ),
         max_llm_calls=_positive_int(params.get("max_llm_calls", 400), "max_llm_calls"),
+        session_max_attempts=_positive_int(
+            params.get("session_max_attempts", 3), "session_max_attempts"
+        ),
         max_fold_minutes=_positive_int(
             params.get("max_fold_minutes", 240), "max_fold_minutes"
         ),
@@ -873,6 +877,7 @@ def run_local_interactive_worker(
         status_path=hitl / "status.json",
         poll_seconds=poll_seconds,
         post_fold_hook=_build_post_fold_hook(options, hitl / "analysis"),
+        session_max_attempts=options.rolling.session_max_attempts,
     )
     result = interactive.run()
     if result["status"] != "complete":
