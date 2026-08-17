@@ -190,10 +190,13 @@ class Timeview:
             replay_index=replay_frames.get("text_index", pd.DataFrame()),
             replay_library_dir=Path(replay_text_library_dir) if replay_text_library_dir is not None else None,
         )
-        # The universe never rolls; expose the frozen copy directly.
+        # The universe never rolls. Expose it as a parts directory so
+        # ``asof_dir + "/universe"`` matches every other domain.
         universe = self.snapshot_dir / "universe.parquet"
         if universe.exists():
-            _link_or_copy(universe, self.host_dir / "universe.parquet")
+            universe_dir = self.host_dir / "universe"
+            universe_dir.mkdir(parents=True, exist_ok=True)
+            _link_or_copy(universe, universe_dir / "part_0000.parquet")
 
     def append_replay_partition(self, domain: str, replay: pd.DataFrame) -> None:
         """Add one bounded source partition to an incremental replay domain."""

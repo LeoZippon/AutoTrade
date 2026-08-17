@@ -648,11 +648,11 @@ def _discard_ephemeral_asof(asof_dir: Path) -> None:
     if not asof_dir.exists():
         return
     try:
+        # Directories must be writable to unlink children. Do not chmod files:
+        # Timeview hardlinks snapshot parquet into asof, so mode changes would
+        # unfreeze the decision snapshot and fail the next Validation.
         for path in [asof_dir, *(item for item in asof_dir.rglob("*") if item.is_dir())]:
             path.chmod(0o755)
-        for path in asof_dir.rglob("*"):
-            if path.is_file() or path.is_symlink():
-                path.chmod(0o644)
         shutil.rmtree(asof_dir)
     except OSError as exc:
         raise RuntimeError(f"cannot discard ephemeral asof view: {asof_dir}: {exc}") from exc

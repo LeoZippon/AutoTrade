@@ -141,6 +141,7 @@ def generate_orders(context):
         "macro": len(pd.read_parquet(context.asof_dir + "/macro")),
         "fundamentals": len(pd.read_parquet(context.asof_dir + "/fundamentals")),
         "text": len(pd.read_parquet(context.asof_dir + "/text_index")),
+        "universe": len(pd.read_parquet(context.asof_dir + "/universe")),
         "nl": len(context.nl(query="visibletoken", mode="search")["evidence"]),
     }
     return [{
@@ -193,6 +194,7 @@ def generate_orders(context):
         "macro": 1,
         "fundamentals": 1,
         "text": 1,
+        "universe": 1,
         "nl": 1,
     }
     assert second["visible"] == {
@@ -203,6 +205,7 @@ def generate_orders(context):
         "macro": 2,
         "fundamentals": 2,
         "text": 2,
+        "universe": 1,
         "nl": 2,
     }
     assert record["pit"]["refresh_calls"] == 2
@@ -214,6 +217,10 @@ def generate_orders(context):
     assert (result_dir / "result.json").is_file()
     assert (result_dir / "style_analysis.json").is_file()
     assert not (result_dir / "asof").exists()
+    assert all(
+        not stat.S_IMODE(path.stat().st_mode) & (stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH)
+        for path in (snapshot, *snapshot.rglob("*"))
+    )
 
 
 def test_first_month_inference_can_have_empty_bars_with_long_pit_daily_history(
