@@ -520,7 +520,7 @@ def test_fold_prompt_and_strategy_reference_encode_the_performance_contract():
     prompt = build_system_prompt(mode="fold", experiment_facts={})
     for rule in (
         "尽早调用 `daily_backtest`",
-        "不要在 `workspace/` 自建全历史模拟器",
+        "不要用 `workspace/` 里的自建回放代替 `daily_backtest`",
         "一次有界前台调用",
         "不得用后台进程",
         "每次调用先核对 `context.asof_version`",

@@ -1024,10 +1024,9 @@ class LLMFoldDeveloper:
         # (build_fold_directive_section), not an instruction suffix: it must
         # carry the framing and precedence rules every session sees, and must
         # not be re-stated in the user turn.
-        return (
-            request.prompt_override.strip()
-            or "Inspect the parent strategy, make one evidence-backed daily JSON strategy improvement, call modification_check and daily_backtest, then select a complete current-run Step with finish_fold."
-        )
+        from autotrade.agent.prompts import FOLD_DEFAULT_INSTRUCTION
+
+        return request.prompt_override.strip() or FOLD_DEFAULT_INSTRUCTION
 
 
 class LLMMetaLearner:

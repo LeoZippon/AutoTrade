@@ -12,6 +12,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from autotrade.agent.runner import (
+    TASTE_MAX_CHARS,
     TasteFinishTool,
     taste_policy_violation,
     visible_window_dates,
@@ -97,6 +98,13 @@ class TastePolicyTest(unittest.TestCase):
             self.assertEqual(
                 taste_policy_violation(path, window_dates=visible_window_dates(MANIFEST_2021)), ""
             )
+
+    def test_a_ledger_length_taste_is_refused(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = _taste(Path(tmp), "# 品味\n" + ("可迁移方向。\n" * (TASTE_MAX_CHARS // 6)))
+            violation = taste_policy_violation(path, window_dates=set())
+            self.assertIn("characters", violation)
+            self.assertIn(str(TASTE_MAX_CHARS), violation)
 
     def test_a_missing_or_empty_taste_is_refused(self) -> None:
         with TemporaryDirectory() as tmp:

@@ -1105,6 +1105,9 @@ _DATE_EXPR = re.compile(
     r"|[Qq][1-4]\s*(?:19|20)\d{2}"
 )
 
+# Taste is injected into every later Fold prompt. Keep a short prior.
+TASTE_MAX_CHARS = 4000
+
 
 def visible_window_dates(manifest: Mapping[str, object]) -> set[str]:
     """Years and YYYYMMDD period bounds of the meta-learning visible fold, read
@@ -1132,7 +1135,8 @@ def taste_policy_violation(taste_path: Path, *, window_dates: set[str]) -> str:
     """Why this taste.md may not be accepted, or "" when it is acceptable.
 
     The Taste is injected into every later Fold prompt, so a calendar date in
-    it carries hidden-schedule evidence forward. Reject dates two ways, robust
+    it carries hidden-schedule evidence forward, and a long process ledger
+    drowns the Fold contract. Reject overlong files and dates two ways, robust
     to the visible fold switching years: generic date expressions (_DATE_EXPR),
     plus the actual visible-window years/bounds read from the manifest even
     when written bare. Cadence words (季度/月/周) and plain counts/percentages
@@ -1143,6 +1147,12 @@ def taste_policy_violation(taste_path: Path, *, window_dates: set[str]) -> str:
     text = taste_path.read_text(encoding="utf-8", errors="replace")
     if not text.strip():
         return "taste.md must be non-empty before finishing"
+    nchars = len(text.strip())
+    if nchars > TASTE_MAX_CHARS:
+        return (
+            f"taste.md is {nchars} characters; keep it to {TASTE_MAX_CHARS} "
+            "as a short directional prior, then call finish_meta again"
+        )
     bare_window = (
         re.compile(
             r"\b(?:"
