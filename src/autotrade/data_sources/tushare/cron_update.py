@@ -351,6 +351,7 @@ def build_job_commands(ctx: RunContext) -> list[list[str]]:
         ]
         command.extend(ctx.config.get("default_update_args", []))
         command.extend(ctx.job.get("extra_args", []))
+        command.extend(["--landing-job", ctx.job_name])
         return [command]
     if operation == "audit_event_flow":
         command = [

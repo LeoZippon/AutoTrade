@@ -37,9 +37,8 @@ QUANT_PYTHON=/home/lzp/miniconda3/envs/quant/bin/python
 # After normal same-day releases should have landed. The job uses a rolling
 # recent window with open-window refreshes plus selected reference/daily
 # refreshes, not a full-history re-scan from the research lower bound. T+1
-# margin sources are handled by the pre-open jobs below. The update sequence
-# includes a single-shot validated stk_auction recheck (catch-up when the
-# morning capture failed; late source corrections publish here).
+# margin sources are handled by the pre-open jobs below. stk_auction recheck
+# is cn_evening_auction_backfill, not this job.
 35 23 * * * cd $REPO_ROOT && $QUANT_PYTHON scripts/data/tushare_cron_update.py --job cn_evening_full
 
 # Refresh the six data-quality status files over the full retained window
@@ -84,7 +83,7 @@ QUANT_PYTHON=/home/lzp/miniconda3/envs/quant/bin/python
 # Opening-auction results publish between 09:27 and 09:29. The first run polls
 # through that window; the same job retries at 09:31 only if the first did not
 # finish successfully (skip_if_already_ok prevents a second generation publish).
-# Late-day catch-up and source-correction rechecks happen inside cn_evening_full.
+# Late-day catch-up and source-correction rechecks happen in cn_evening_auction_backfill.
 27 9 * * * cd $REPO_ROOT && $QUANT_PYTHON scripts/data/tushare_cron_update.py --job cn_open_auction_capture_0927
 31 9 * * * cd $REPO_ROOT && $QUANT_PYTHON scripts/data/tushare_cron_update.py --job cn_open_auction_capture_0927
 

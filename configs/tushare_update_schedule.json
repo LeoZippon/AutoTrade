@@ -602,7 +602,7 @@
       "domain": "base_research",
       "frequency": "trade_date",
       "official_update": "交易日09:27-09:29可获取当日最终开盘集合竞价成交；历史从2025-01-16起可用。",
-      "cron_policy": "same_day_poll_0927_then_retry_0931_and_2320_forced_reconciliation",
+      "cron_policy": "same_day_poll_0927_then_retry_0931_and_2332_evening_backfill",
       "doc_ref": "https://tushare.pro/document/2?doc_id=369"
     },
     {

@@ -2182,6 +2182,7 @@ class TuShareDownloadUpdateGuardsTest(unittest.TestCase):
         args = argparse.Namespace(
             raw_dir=str(self.raw_dir),
             end_date="20260713",
+            landing_job="cn_evening_auction_backfill",
             page_limit=10000,
             revision_ledger=str(self.root / "revision_events.jsonl"),
             min_interval_seconds=0.0,
@@ -2207,7 +2208,7 @@ class TuShareDownloadUpdateGuardsTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("recheck_published", out)
         availability = common.parquet_meta(target)["availability"]
-        self.assertEqual(availability["landing_job"], "cn_evening_full")
+        self.assertEqual(availability["landing_job"], "cn_evening_auction_backfill")
         first_bytes = target.read_bytes()
 
         # Unchanged content (even reordered): no rewrite; the partition bytes

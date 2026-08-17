@@ -48,10 +48,7 @@ from .hitl_state import (
     read_status,
 )
 from .interactive import InteractiveExperimentRunner
-from .ledger import (
-    ExperimentLedger,
-    latest_fold_records,
-)
+from .ledger import ExperimentLedger
 from .local_backend import (
     DeterministicBaselineDeveloper,
     LLMFoldDeveloper,
@@ -929,32 +926,53 @@ def _latest_artifact(
     ledger: ExperimentLedger,
     store: FilesystemArtifactStore,
 ) -> FrozenArtifact | None:
-    records = latest_fold_records(ledger.read()).values()
-    if not records:
+    current_id = ""
+    current_path = ""
+    current_record: dict[str, object] | None = None
+    requires_validation = False
+    for record in ledger.read():
+        record_type = record.get("record_type")
+        if record_type == "fold":
+            artifact_id = str(record.get("frozen_strategy_artifact_id") or "")
+            path = str(record.get("frozen_strategy_artifact_path") or "")
+            if not artifact_id:
+                continue
+            current_id = artifact_id
+            current_path = path
+            current_record = record
+            requires_validation = False
+        elif (
+            record_type == "meta_learning"
+            and record.get("status") == "meta_regularized"
+        ):
+            artifact_id = str(record.get("frozen_strategy_artifact_id") or "")
+            if not artifact_id:
+                continue
+            current_id = artifact_id
+            current_path = str(record.get("frozen_strategy_artifact_path") or "")
+            current_record = record
+            requires_validation = True
+    if not current_id or current_record is None:
         return None
-    record = list(records)[-1]
-    artifact_id = str(record.get("frozen_strategy_artifact_id") or "")
-    path = str(record.get("frozen_strategy_artifact_path") or "")
-    if not artifact_id or not path:
-        raise RuntimeError(
-            "latest Fold record does not reference a usable frozen artifact"
-        )
     try:
         frozen = store.frozen(
-            artifact_id,
-            expected_path=path,
-            experiment_id=str(record.get("experiment_id") or ""),
+            current_id,
+            expected_path=current_path or None,
+            experiment_id=str(current_record.get("experiment_id") or ""),
         )
     except Exception as exc:
-        raise RuntimeError(f"latest Fold artifact failed validation: {exc}") from exc
+        raise RuntimeError(
+            f"ledger artifact failed validation: {current_id}: {exc}"
+        ) from exc
     return FrozenArtifact(
-        artifact_id,
+        current_id,
         Path(frozen.path),
         Path(frozen.model_path) if frozen.model_path is not None else None,
         str(frozen.source_run_id),
         str(frozen.source_fold_id),
         str(frozen.source_step_id),
         str(frozen.revision_id),
+        requires_validation=requires_validation,
     )
 
 

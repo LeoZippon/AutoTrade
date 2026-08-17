@@ -1155,3 +1155,32 @@ def test_a_cpu_only_sandbox_never_consults_the_gpu_selector(tmp_path: Path):
         sandbox.start()
     assert sandbox.gpu_indices == []
     assert "--gpus" not in run.call_args_list[0][0][0]
+
+
+def test_collect_artifacts_prefers_workspace_output_and_models(tmp_path: Path):
+    local = LocalSandbox(tmp_path / "session")
+    paths = local.prepare_layout()
+    work_output = paths.workspace / "output"
+    work_models = paths.workspace / "models"
+    work_output.mkdir(parents=True, exist_ok=True)
+    work_models.mkdir(parents=True, exist_ok=True)
+    (work_output / "main.py").write_text(
+        "def generate_orders(context):\n    return []\n", encoding="utf-8"
+    )
+    (work_models / "weights.json").write_text("{}", encoding="utf-8")
+    dest = local.collect_artifacts(tmp_path / "collected")
+    assert (dest / "output" / "main.py").read_text(encoding="utf-8") == (
+        "def generate_orders(context):\n    return []\n"
+    )
+    assert (dest / "models" / "weights.json").read_text(encoding="utf-8") == "{}"
+    assert (dest / "workspace" / "output" / "main.py").exists()
+
+
+def test_collect_artifacts_falls_back_to_sibling_when_workspace_copy_is_empty(
+    tmp_path: Path,
+):
+    local = LocalSandbox(tmp_path / "session")
+    paths = local.prepare_layout()
+    (paths.agent_output / "main.py").write_text("sibling\n", encoding="utf-8")
+    dest = local.collect_artifacts(tmp_path / "collected")
+    assert (dest / "output" / "main.py").read_text(encoding="utf-8") == "sibling\n"

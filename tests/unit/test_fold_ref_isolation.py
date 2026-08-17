@@ -24,6 +24,7 @@ from pathlib import Path
 import pytest
 
 from autotrade.agent.experiment_facts import build_experiment_facts
+from autotrade.environment.artifacts import FilesystemArtifactStore
 from autotrade.environment.identity import agent_visible_ref
 from autotrade.environment.llm import ProviderResponse, ScriptedLLM, ToolCall
 from autotrade.pipelines.agent_views import (
@@ -31,6 +32,7 @@ from autotrade.pipelines.agent_views import (
     compact_fold_history,
 )
 from autotrade.pipelines.ledger import ExperimentLedger
+from autotrade.pipelines.local_backend import LLMMetaLearner
 from autotrade.pipelines.worker import load_worker_options, run_local_interactive_worker
 
 from .test_interactive_worker_local import _NoShellRunner, _experiment
@@ -263,3 +265,60 @@ def test_agent_visible_ref_is_stable_and_not_reversible_by_prefix_collision():
     assert agent_visible_ref(None, prefix="fold_ref") == agent_visible_ref(
         "", prefix="fold_ref"
     )
+
+
+def test_meta_context_parent_artifact_id_is_an_opaque_strategy_ref(tmp_path: Path):
+    parent_id = "strategy_epoch_002_fold_2025Q2_59852cdf4fb8"
+    baseline = tmp_path / "baseline" / "main.py"
+    baseline.parent.mkdir()
+    baseline.write_text("def generate_orders(context):\n    return []\n", encoding="utf-8")
+    store = FilesystemArtifactStore(tmp_path / "artifacts")
+    parent_output = store.frozen_root / parent_id / "output"
+    parent_output.mkdir(parents=True)
+    (parent_output / "main.py").write_text(baseline.read_text(encoding="utf-8"), encoding="utf-8")
+    llm = ScriptedLLM(
+        [
+            ProviderResponse(
+                tool_calls=(
+                    ToolCall(
+                        "taste", "write_taste", {"taste": "prefer simple signals"}
+                    ),
+                    ToolCall("finish_meta", "finish_meta", {"taste_path": "taste.md"}),
+                )
+            )
+        ]
+    )
+    learner = LLMMetaLearner(
+        llm=llm,
+        baseline_strategy=baseline,
+        artifact_store=store,
+        experiment_dir=tmp_path / "experiment",
+        runtime_root=tmp_path / "runtime",
+        max_llm_calls=2,
+        deadline_seconds=30.0,
+        use_docker=False,
+        rebuild_enabled=False,
+    )
+    learner(
+        {
+            "run_id": "run_meta",
+            "experiment_id": "exp",
+            "epoch_id": "epoch_002",
+            "meta_learning_id": "epoch_002_after_fold",
+            "parent_artifact_id": parent_id,
+        }
+    )
+    expected = agent_visible_ref(parent_id, prefix="strategy_ref")
+    public = json.loads(
+        (tmp_path / "run_meta" / "workspace" / "inputs" / "meta_context.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert public["parent_artifact_id"] == expected
+    assert public["parent_artifact_id"].startswith("strategy_ref_")
+    assert "strategy_epoch_" not in public["parent_artifact_id"]
+    assert "fold_2025Q2" not in public["parent_artifact_id"]
+    host = json.loads(
+        (tmp_path / "run_meta" / "host_run_manifest.json").read_text(encoding="utf-8")
+    )
+    assert host["parent_strategy_artifact_id"] == parent_id

@@ -880,7 +880,7 @@ def _recheck_stk_auction_day(args: argparse.Namespace, repo_root: Path, raw_dir:
         result,
         pages,
         args.page_limit,
-        "cn_evening_full",
+        getattr(args, "landing_job", "cn_evening_auction_backfill"),
         getattr(args, "revision_ledger", REVISION_EVENTS_PATH),
     )
     if not wrote:
@@ -3878,6 +3878,7 @@ def add_auction_recheck_parser(sub: argparse._SubParsersAction) -> None:
     core.add_raw_arg(parser)
     parser.add_argument("--start-date", required=True)
     parser.add_argument("--end-date", required=True)
+    parser.add_argument("--landing-job", default="cn_evening_auction_backfill")
     parser.add_argument("--page-limit", type=int, default=TRADE_DATE_PAGE_LIMIT)
     parser.add_argument("--revision-ledger", default=REVISION_EVENTS_PATH)
     parser.add_argument("--min-interval-seconds", type=float, default=0.35)

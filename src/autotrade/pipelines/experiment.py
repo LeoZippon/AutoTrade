@@ -403,9 +403,10 @@ class RollingExperimentPipeline:
             prune = getattr(self.artifacts, "prune_transient", None)
             if callable(prune):
                 prune(
-                    keep_frozen_ids=(retained_artifact_id,)
-                    if retained_artifact_id is not None
-                    else ()
+                    keep_frozen_ids=_keep_frozen_artifact_ids(
+                        self.ledger.read(),
+                        extra_id=retained_artifact_id,
+                    )
                 )
 
     def run_heldout(
@@ -723,6 +724,35 @@ class RollingExperimentPipeline:
             previous_taste,
             session_context,
         )
+
+
+def _keep_frozen_artifact_ids(
+    records: list[dict[str, object]],
+    extra_id: str | None = None,
+) -> tuple[str, ...]:
+    """Frozen trees still named by the latest fold/meta frontier, plus the fold now finishing."""
+    keep: set[str] = set()
+    extra = str(extra_id or "")
+    if extra:
+        keep.add(extra)
+    for record in latest_fold_records(records).values():
+        artifact_id = str(record.get("frozen_strategy_artifact_id") or "")
+        if artifact_id:
+            keep.add(artifact_id)
+    latest_meta: dict[str, dict[str, object]] = {}
+    for record in records:
+        if record.get("record_type") != "meta_learning":
+            continue
+        session_key = str(record.get("session_key") or "")
+        if session_key:
+            latest_meta[session_key] = record
+    for record in latest_meta.values():
+        if record.get("status") != "meta_regularized":
+            continue
+        artifact_id = str(record.get("frozen_strategy_artifact_id") or "")
+        if artifact_id:
+            keep.add(artifact_id)
+    return tuple(sorted(keep))
 
 
 def _select_step(

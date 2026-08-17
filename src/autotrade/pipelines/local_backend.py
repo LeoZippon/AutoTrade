@@ -860,6 +860,7 @@ class LLMFoldDeveloper:
                         request.finalize_before_deadline_seconds
                     ),
                     max_llm_calls=request.max_llm_calls,
+                    max_steps=request.max_steps,
                     deadline_seconds=request.deadline_seconds,
                     max_response_tokens=self.max_response_tokens,
                 ),
@@ -1150,6 +1151,10 @@ class LLMMetaLearner:
             for key, value in facts.items()
             if key not in {"user_question_hook", "progress_hook", "meta_learning_memory"}
         }
+        if parent_id:
+            public["parent_artifact_id"] = agent_visible_ref(
+                parent_id, prefix="strategy_ref"
+            )
         write_json_atomic(inputs / "meta_context.json", public)
         # Raw prior Meta traces, bounded by meta_memory_max_epochs: a JSONL file
         # rather than a prompt field, because it is line-oriented and can be
