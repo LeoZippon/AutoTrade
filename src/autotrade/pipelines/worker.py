@@ -505,7 +505,7 @@ def resolve_worker_options(
         max_backtests_per_fold=_positive_int(
             params.get("max_backtests_per_fold", 30), "max_backtests_per_fold"
         ),
-        max_llm_calls=_positive_int(params.get("max_llm_calls", 200), "max_llm_calls"),
+        max_llm_calls=_positive_int(params.get("max_llm_calls", 400), "max_llm_calls"),
         max_fold_minutes=_positive_int(
             params.get("max_fold_minutes", 240), "max_fold_minutes"
         ),

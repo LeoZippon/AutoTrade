@@ -81,7 +81,7 @@ WEB_CREATE_DEFAULTS: dict[str, object] = {
     "min_region_trade_days": 2,
     "max_steps_per_fold": 20,
     "max_backtests_per_fold": 30,
-    "max_llm_calls": 200,
+    "max_llm_calls": 400,
     "max_fold_minutes": 240,
     "convergence_start_epoch": 3,
     "nl_failure_policy": "return_error_with_audit",

@@ -129,7 +129,7 @@ class RollingExperimentConfig:
     min_region_trade_days: int = 2
     max_steps_per_fold: int = 10
     max_backtests_per_fold: int = 30
-    max_llm_calls: int = 200
+    max_llm_calls: int = 400
     max_fold_minutes: int = 240
     # Trailing wrap-up grace handed to the Agent session on top of the main
     # Fold deadline (experiment.py adds it to the session budget; the runner
