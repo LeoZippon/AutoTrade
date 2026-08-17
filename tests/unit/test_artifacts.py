@@ -126,6 +126,18 @@ def generate_orders(context):
             self.assertFalse((dest / "__pycache__").exists())
             load_strategy_artifact(dest)
 
+    def test_copy_artifact_skips_runtime_cache(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = write_artifact(Path(tmp) / "source")
+            cache_dir = source / "__pycache__"
+            cache_dir.mkdir()
+            (cache_dir / "x.pyc").write_bytes(b"x")
+            dest = Path(tmp) / "dest"
+            copy_artifact(source, dest)
+            self.assertTrue((dest / "main.py").exists())
+            self.assertFalse((dest / "__pycache__").exists())
+            load_strategy_artifact(dest)
+
     def test_allows_subdirectories_and_rejects_unsupported_files_cache_and_symlinks(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = write_artifact(Path(tmp))

@@ -279,9 +279,17 @@ def init_from_template(template_dir: str | Path, dest_root: str | Path) -> None:
 
 
 def copy_artifact(source_root: str | Path, dest_root: str | Path) -> None:
-    """Copy one strategy artifact directory, replacing any existing copy."""
+    """Copy one strategy artifact directory, replacing any existing copy.
+
+    Runtime caches next to the source (including the output template) are
+    skipped; official load/freeze still reject them if they remain in dest.
+    """
     source_root = Path(source_root)
-    _copy_revision(source_root, Path(dest_root), _artifact_files(source_root))
+    _copy_revision(
+        source_root,
+        Path(dest_root),
+        _artifact_files(source_root, reject_runtime_cache=False),
+    )
 
 
 def copy_model_artifacts(source_root: str | Path | None, dest_root: str | Path) -> None:
