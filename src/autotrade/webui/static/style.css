@@ -999,22 +999,39 @@ textarea.directive {
  color: var(--bad);
 }
 
-details.trace-replay > summary {
- cursor: pointer;
+.trace-replay-toggle {
+ appearance: none;
+ -webkit-appearance: none;
+ display: flex;
+ align-items: center;
+ gap: 0.35rem;
+ width: 100%;
+ margin: 0;
+ padding: 0;
+ border: 0;
+ background: none;
+ box-shadow: none;
+ font: inherit;
  font-size: 0.875rem;
- color: var(--muted);
  font-weight: 600;
  letter-spacing: 0.02em;
- list-style: none;
+ color: var(--muted);
+ cursor: pointer;
+ text-align: left;
 }
-details.trace-replay > summary::-webkit-details-marker {
- display: none;
+.trace-replay-toggle::before {
+ content: "▸";
+ font-size: 0.75rem;
+ line-height: 1;
 }
-details.trace-replay > summary::before {
- content: "▸ ";
+.trace-replay.open .trace-replay-toggle::before {
+ content: "▾";
 }
-details.trace-replay[open] > summary::before {
- content: "▾ ";
+.trace-replay-toggle:hover,
+.trace-replay-toggle:focus-visible {
+ color: var(--accent);
+ background: none;
+ outline: none;
 }
 .trace-replay-body {
  margin-top: 0.7rem;
@@ -1272,6 +1289,8 @@ details.test-audit summary {
 .field select,
 .field textarea {
  width: 100%;
+ max-width: 100%;
+ min-width: 0;
  border: 1px solid var(--input-border);
  border-radius: 8px;
  padding: 0.5rem 0.7rem;
