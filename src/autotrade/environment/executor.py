@@ -179,22 +179,28 @@ class DockerStrategyExecutor:
                     request = message.get("request")
                     if not isinstance(request, Mapping):
                         raise StrategyExecutionError("worker sent an invalid NL request")
+                    # Host NL is a trusted service with its own quotas. Its wait
+                    # is not untrusted strategy compute and must not burn the
+                    # generate_orders inference cap.
+                    nl_started = time.monotonic()
                     try:
-                        response = context.nl(**dict(request))
-                    except Exception as exc:  # noqa: BLE001 - host service errors cross the protocol
-                        self._send(
-                            {"type": "nl_response", "sequence": sequence, "error": str(exc)},
-                            deadline,
-                        )
-                    else:
-                        self._send(
-                            {
+                        try:
+                            response = context.nl(**dict(request))
+                        except Exception as exc:  # noqa: BLE001 - host errors cross the protocol
+                            payload: dict[str, object] = {
+                                "type": "nl_response",
+                                "sequence": sequence,
+                                "error": str(exc),
+                            }
+                        else:
+                            payload = {
                                 "type": "nl_response",
                                 "sequence": sequence,
                                 "result": dict(response),
-                            },
-                            deadline,
-                        )
+                            }
+                    finally:
+                        deadline += time.monotonic() - nl_started
+                    self._send(payload, deadline)
                     continue
                 if message_type == "orders":
                     self._transport_sequence = sequence

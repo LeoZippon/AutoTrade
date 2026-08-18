@@ -906,6 +906,41 @@ def test_executor_rejects_strict_json_type_or_value_drift_in_cached_prefix(
     assert executor._transport_bar_identity is original_identity
 
 
+def test_host_nl_wait_does_not_consume_the_inference_cap(tmp_path: Path):
+    strategy = _strategy(
+        tmp_path,
+        """def generate_orders(context):
+    context.nl(query="signal", mode="search", limit=1)
+    return []
+""",
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-m", "autotrade.environment.strategy_worker", str(strategy)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    executor = _executor_for_process(process, limits=SandboxLimits(timeout_seconds=0.2))
+
+    def slow_nl(request, *, inference_at):
+        time.sleep(0.5)
+        return {"status": "ok", "query": request.get("query"), "evidence": []}
+
+    context = StrategyContext(
+        inference_at=datetime(2026, 1, 2, 8, 30, tzinfo=CN_TZ),
+        bars=(),
+        account=AccountSnapshot(cash=10_000, positions={}),
+        _nl_query=slow_nl,
+    )
+    started = time.monotonic()
+    try:
+        assert executor.execute(context) == []
+    finally:
+        executor.close()
+    assert time.monotonic() - started >= 0.5
+    assert process.poll() == 0
+
+
 def test_inference_timeout_aborts_and_closes_worker():
     limits = SandboxLimits(timeout_seconds=0.05)
     process = subprocess.Popen(

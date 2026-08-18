@@ -177,7 +177,9 @@ def test_context_record_round_trip_and_host_nl_pit_validation():
     assert restored.snapshot_dir == "/strategy-data/snapshot"
     assert restored.asof_dir == "/strategy-data/asof"
     assert restored.asof_version == "3"
-    assert restored.nl(question="status")["text"] == "known"
+    nl_result = restored.nl(question="status")
+    assert type(nl_result) is dict
+    assert nl_result["text"] == "known"
     assert observed == [({"question": "status"}, inference_at)]
 
     def future_query(_request, *, inference_at):

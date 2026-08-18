@@ -354,7 +354,7 @@ class StrategyContext:
         response = self._nl_query(normalized, inference_at=self.inference_at)
         normalized_response = _json_mapping(response, name="NL response")
         _validate_pit_tree(normalized_response, inference_at=self.inference_at, name="NL response")
-        return MappingProxyType(normalized_response)
+        return normalized_response
 
     def to_record(self) -> dict[str, object]:
         record = {
