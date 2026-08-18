@@ -922,7 +922,7 @@ function equityChart(
             `${j ? "L" : "M"}${xOf(dates.indexOf(d)).toFixed(1)},${ddY(s.dd.get(d)).toFixed(1)}`,
         )
         .join(" ");
-      if (s.key !== "benchmark") {
+      if (!String(s.key).startsWith("benchmark")) {
         const first = xOf(dates.indexOf(pts[0])).toFixed(1);
         const last = xOf(dates.indexOf(pts[pts.length - 1])).toFixed(1);
         svg.push(
@@ -999,7 +999,7 @@ function equityChart(
     svg.push(
       `<path d="${line}" fill="none" stroke="${s.color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"${s.dash ? ` stroke-dasharray="${s.dash}"` : ""}/>`,
     );
-    if (s.key !== "benchmark") {
+    if (!String(s.key).startsWith("benchmark")) {
       const lastDate = pts[pts.length - 1];
       svg.push(
         `<circle cx="${xOf(dates.indexOf(lastDate)).toFixed(1)}" cy="${yOf(s.cum.get(lastDate)).toFixed(1)}" r="3.5" fill="${s.color}" stroke="${INK.ring}" stroke-width="2"/>`,
