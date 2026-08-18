@@ -57,8 +57,18 @@ def _slot_benchmark(replay_dir: Path | None) -> dict[str, float]:
     path = Path(replay_dir) / "macro.parquet"
     if not path.is_file():
         return {}
-    frame = pd.read_parquet(path)
     required = {"dataset", "ts_code", "trade_date", "pct_chg"}
+    try:
+        frame = pd.read_parquet(
+            path,
+            columns=list(required),
+            filters=[
+                ("dataset", "==", "index_daily"),
+                ("ts_code", "==", BENCHMARK_TS_CODE),
+            ],
+        )
+    except Exception:
+        frame = pd.read_parquet(path)
     if not required.issubset(frame.columns):
         return {}
     rows = frame[

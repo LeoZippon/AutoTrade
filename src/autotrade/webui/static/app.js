@@ -579,16 +579,16 @@ function chartLegend(seriesList) {
    neutral ink (a reference, not a categorical slot). */
 const EQUITY_CACHE = new Map(); // `${experiment_id}::${epoch_id}` -> { fp, payload }
 
-async function fetchExperimentEquity(expId, fp, epochId = null) {
+function fetchExperimentEquity(expId, fp, epochId = null) {
   const cacheKey = `${expId}::${epochId || ""}`;
   const hit = EQUITY_CACHE.get(cacheKey);
-  if (hit && hit.fp === fp) return hit.payload;
+  if (hit && hit.fp === fp) return hit.ready;
   const query = epochId ? `?epoch_id=${encodeURIComponent(epochId)}` : "";
-  const payload = await api(
+  const ready = api(
     `/api/experiments/${encodeURIComponent(expId)}/equity${query}`,
   );
-  EQUITY_CACHE.set(cacheKey, { fp, payload });
-  return payload;
+  EQUITY_CACHE.set(cacheKey, { fp, ready });
+  return ready;
 }
 
 function epochShort(epochId) {
@@ -1392,13 +1392,21 @@ function experimentCard(item) {
     ]),
   );
   if ((item.fold_returns || []).length) {
-    card.append(
-      equityHost(item.experiment_id, equityFingerprint(item), {
+    const fingerprint = equityFingerprint(item);
+    const keepId = `equity-card-${item.experiment_id}`;
+    const existing = document.getElementById(keepId);
+    if (existing && existing.dataset.fp === fingerprint) {
+      card.append(existing);
+    } else {
+      const host = equityHost(item.experiment_id, fingerprint, {
         width: 400,
         height: 130,
         mini: true,
-      }),
-    );
+      });
+      host.id = keepId;
+      host.dataset.fp = fingerprint;
+      card.append(host);
+    }
   }
   const actions = el("div", { class: "actions" });
   if (item.kind === "hitl" && RESUMABLE_STATES.includes(item.state)) {
