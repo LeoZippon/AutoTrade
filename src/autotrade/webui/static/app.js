@@ -140,7 +140,8 @@ function refreshCharts() {
     /* private mode */
   }
   const apply = (value) => {
-    document.body.style.zoom = value;
+    document.documentElement.style.setProperty("--ui-zoom", value);
+    document.body.style.zoom = "";
     try {
       localStorage.setItem("ch_zoom", value);
     } catch {
@@ -2718,7 +2719,6 @@ function sessionDetailPanel(detail, selectedKey) {
       el(
         "div",
         { class: "panel section-gap" },
-        el("h4", {}, "Agent Trace（回放）"),
         session.kind === "fold"
           ? el(
               "div",
@@ -3857,39 +3857,25 @@ function liveTracePanel(detail, session) {
 /* Replay loader: batched pages, collapsible, with a raw .jsonl download so the
    browser never has to hold a 20MB trace as DOM just to archive it. */
 function traceReplayNode(experimentId, runId) {
-  const box = el("div", { class: "trace-box", style: "display:none" });
+  const box = el("div", { class: "trace-box" });
   const info = el("span", { class: "hint", style: "margin:0" }, "");
+  const moreButton = el(
+    "button",
+    { class: "btn small", style: "display:none" },
+    "继续加载",
+  );
   let offset = 0,
     loadedEvents = 0,
     eof = false,
-    expanded = false,
     loading = false;
-  const loadButton = el("button", { class: "btn small" }, "加载 Trace");
-  const foldButton = el(
-    "button",
-    { class: "btn small", style: "display:none" },
-    "收起",
-  );
-  function syncButtons() {
-    loadButton.disabled = loading;
-    if (!expanded) {
-      loadButton.textContent = loadedEvents ? "展开 Trace" : "加载 Trace";
-      loadButton.style.display = "";
-      foldButton.style.display = "none";
-      return;
-    }
-    foldButton.style.display = "";
-    if (eof) {
-      loadButton.style.display = "none";
-      return;
-    }
-    loadButton.textContent = loadedEvents ? "继续加载" : "加载 Trace";
-    loadButton.style.display = "";
+  function syncMore() {
+    moreButton.disabled = loading;
+    moreButton.style.display = eof || !loadedEvents ? "none" : "";
   }
   async function loadBatch() {
     if (loading || eof) return;
     loading = true;
-    syncButtons();
+    syncMore();
     try {
       // ~2MB / batch keeps even huge traces incremental.
       for (let page = 0; page < 4 && !eof; page += 1) {
@@ -3908,24 +3894,10 @@ function traceReplayNode(experimentId, runId) {
       info.textContent = `加载失败：${error.message}`;
     } finally {
       loading = false;
-      syncButtons();
+      syncMore();
     }
   }
-  loadButton.addEventListener("click", async () => {
-    if (!expanded) {
-      expanded = true;
-      box.style.display = "";
-      if (!loadedEvents) await loadBatch();
-      else syncButtons();
-      return;
-    }
-    await loadBatch();
-  });
-  foldButton.addEventListener("click", () => {
-    expanded = false;
-    box.style.display = "none";
-    syncButtons();
-  });
+  moreButton.addEventListener("click", loadBatch);
   const download = el(
     "a",
     {
@@ -3934,19 +3906,21 @@ function traceReplayNode(experimentId, runId) {
     },
     "⬇ 下载完整 .jsonl",
   );
-  return el(
-    "div",
-    {},
+  const details = el(
+    "details",
+    { class: "trace-replay" },
+    el("summary", {}, "Agent Trace（回放）"),
     el(
       "div",
-      { class: "control-bar" },
-      loadButton,
-      foldButton,
-      download,
-      info,
+      { class: "trace-replay-body" },
+      el("div", { class: "control-bar" }, moreButton, download, info),
+      box,
     ),
-    box,
   );
+  details.addEventListener("toggle", () => {
+    if (details.open && !loadedEvents && !loading) loadBatch();
+  });
+  return details;
 }
 
 /* Build the body only when the <details> is first opened: a long trace holds

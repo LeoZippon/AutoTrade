@@ -79,15 +79,22 @@
  box-sizing: border-box;
 }
 html {
- font-size: clamp(14px, 12px + 0.22vw, 17.5px);
+ --ui-zoom: 1;
+ --topbar-h: calc(4rem + env(safe-area-inset-top, 0px));
+ font-size: calc(clamp(14px, 12px + 0.22vw, 17.5px) * var(--ui-zoom));
  -webkit-text-size-adjust: 100%;
+ overflow-x: clip;
+ overscroll-behavior-x: none;
 }
 html,
 body {
  margin: 0;
  padding: 0;
+ max-width: 100%;
 }
 body {
+ overflow-x: hidden;
+ overscroll-behavior-x: none;
  background: var(--bg);
  color: var(--text);
  font:
@@ -110,21 +117,31 @@ a:hover {
  text-decoration: underline;
 }
 
+#app {
+ min-width: 0;
+ overflow-x: hidden;
+ padding-top: var(--topbar-h);
+}
 .topbar {
  display: flex;
  align-items: center;
  justify-content: space-between;
  gap: 0.75rem;
- flex-wrap: wrap;
+ flex-wrap: nowrap;
  background: var(--panel);
  border-bottom: 1px solid var(--border);
- padding: 0.8rem clamp(16px, 3vw, 34px);
- position: sticky;
+ padding: 0.8rem max(16px, env(safe-area-inset-right, 0px))
+  0.8rem max(16px, env(safe-area-inset-left, 0px));
+ padding-top: max(0.8rem, env(safe-area-inset-top, 0px));
+ position: fixed;
  top: 0;
- z-index: 20;
+ left: 0;
+ right: 0;
+ z-index: 40;
  /* Constant height across pages: the homepage's primary button is the tallest
      occupant; without this the bar shrinks on detail pages and layout jumps. */
- min-height: 4rem;
+ min-height: var(--topbar-h);
+ box-sizing: border-box;
 }
 .brand {
  font-size: 1.12rem;
@@ -148,7 +165,8 @@ a:hover {
  display: flex;
  align-items: center;
  gap: 1rem;
- flex-wrap: wrap;
+ flex-wrap: nowrap;
+ min-width: 0;
 }
 /* 顶部导航：研究 / 模拟 / 实盘交易（active class 由 route() 设置）*/
 .topnav {
@@ -186,8 +204,10 @@ a:hover {
 
 main {
  max-width: 1380px;
+ min-width: 0;
  margin: 1.6rem auto;
- padding: 0 clamp(14px, 3vw, 34px) 5rem;
+ padding: 0 max(clamp(14px, 3vw, 34px), env(safe-area-inset-right, 0px))
+  5rem max(clamp(14px, 3vw, 34px), env(safe-area-inset-left, 0px));
 }
 
 /* buttons — flat system: no drop shadows, no native (WebKit) chrome; state
@@ -498,6 +518,12 @@ progress.progress.done::-moz-progress-bar {
  grid-template-columns: 22.5rem minmax(0, 1fr);
  gap: 1.1rem;
  align-items: start;
+ min-width: 0;
+}
+.panel,
+.card,
+.session-detail {
+ min-width: 0;
 }
 /* Right column of the detail grid. Cards keep one rhythm via the flex gap;
    per-card .section-gap top margins (meant for stacked flow layouts) are
@@ -969,6 +995,27 @@ textarea.directive {
  color: var(--bad);
 }
 
+details.trace-replay > summary {
+ cursor: pointer;
+ font-size: 0.875rem;
+ color: var(--muted);
+ font-weight: 600;
+ letter-spacing: 0.02em;
+ list-style: none;
+}
+details.trace-replay > summary::-webkit-details-marker {
+ display: none;
+}
+details.trace-replay > summary::before {
+ content: "▸ ";
+}
+details.trace-replay[open] > summary::before {
+ content: "▾ ";
+}
+.trace-replay-body {
+ margin-top: 0.7rem;
+ min-width: 0;
+}
 /* trace viewer */
 .trace-box {
  max-height: 62vh;
@@ -1668,6 +1715,14 @@ details.advanced .form-grid {
  }
 }
 @media (max-width: 760px) {
+ .topbar-side,
+ .topbar-right {
+  flex-wrap: nowrap;
+  min-width: 0;
+ }
+ .topbar .mode-note {
+  display: none;
+ }
  .grid {
   grid-template-columns: 1fr;
  }
@@ -1689,9 +1744,11 @@ details.advanced .form-grid {
  }
  /* tables scroll sideways instead of overflowing the panel */
  table.data,
- table.kv {
+ table.kv,
+ table.cycle-stats {
   display: block;
   overflow-x: auto;
+  max-width: 100%;
  }
  table.kv td:first-child {
   width: auto;
