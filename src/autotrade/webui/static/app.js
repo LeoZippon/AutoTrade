@@ -3864,16 +3864,32 @@ function traceReplayNode(experimentId, runId) {
     eof = false,
     expanded = false,
     loading = false;
-  const moreButton = el(
+  const loadButton = el("button", { class: "btn small" }, "加载 Trace");
+  const foldButton = el(
     "button",
     { class: "btn small", style: "display:none" },
-    "继续加载",
+    "收起",
   );
-  const toggleButton = el("button", { class: "btn small" }, "加载 trace");
+  function syncButtons() {
+    loadButton.disabled = loading;
+    if (!expanded) {
+      loadButton.textContent = loadedEvents ? "展开 Trace" : "加载 Trace";
+      loadButton.style.display = "";
+      foldButton.style.display = "none";
+      return;
+    }
+    foldButton.style.display = "";
+    if (eof) {
+      loadButton.style.display = "none";
+      return;
+    }
+    loadButton.textContent = loadedEvents ? "继续加载" : "加载 Trace";
+    loadButton.style.display = "";
+  }
   async function loadBatch() {
     if (loading || eof) return;
     loading = true;
-    moreButton.disabled = true;
+    syncButtons();
     try {
       // ~2MB / batch keeps even huge traces incremental.
       for (let page = 0; page < 4 && !eof; page += 1) {
@@ -3886,28 +3902,30 @@ function traceReplayNode(experimentId, runId) {
         offset = Number(data.next_offset) || offset;
         eof = Boolean(data.eof);
       }
-      info.textContent = `已加载 ${loadedEvents} 个事件${eof ? "（全部）" : "，可继续加载"}`;
+      info.textContent = `已加载 ${loadedEvents} 个事件${eof ? "（全部）" : ""}`;
       if (eof) box.append(el("div", { class: "hint" }, "—— trace 结束 ——"));
     } catch (error) {
       info.textContent = `加载失败：${error.message}`;
     } finally {
       loading = false;
-      moreButton.disabled = false;
-      moreButton.style.display = eof || !expanded ? "none" : "";
+      syncButtons();
     }
   }
-  toggleButton.addEventListener("click", async () => {
-    expanded = !expanded;
-    box.style.display = expanded ? "" : "none";
-    toggleButton.textContent = expanded
-      ? "收起 trace"
-      : loadedEvents
-        ? "展开 trace"
-        : "加载 trace";
-    moreButton.style.display = expanded && !eof && loadedEvents ? "" : "none";
-    if (expanded && !loadedEvents) await loadBatch();
+  loadButton.addEventListener("click", async () => {
+    if (!expanded) {
+      expanded = true;
+      box.style.display = "";
+      if (!loadedEvents) await loadBatch();
+      else syncButtons();
+      return;
+    }
+    await loadBatch();
   });
-  moreButton.addEventListener("click", loadBatch);
+  foldButton.addEventListener("click", () => {
+    expanded = false;
+    box.style.display = "none";
+    syncButtons();
+  });
   const download = el(
     "a",
     {
@@ -3922,8 +3940,8 @@ function traceReplayNode(experimentId, runId) {
     el(
       "div",
       { class: "control-bar" },
-      toggleButton,
-      moreButton,
+      loadButton,
+      foldButton,
       download,
       info,
     ),
