@@ -34,6 +34,7 @@ from .proxy import (
     LLMProxyError,
     ProviderResponse,
     ToolCall,
+    clamp_requested_max_tokens,
     context_overflow_error,
     context_request_fits,
 )
@@ -392,21 +393,20 @@ class OpenAICompatibleProxy:
                 requested_max_tokens, self.config.max_output_tokens
             )
         # Vendor-like behaviour: never reject a request merely because the
-        # requested output budget does not fit. When the prompt estimate
-        # leaves less room than requested, clamp max_tokens to the remaining
-        # window — the physical maximum — instead of failing the call. Only a
-        # prompt that alone fills the window is a true overflow.
-        fits, estimated_prompt_tokens, context_window = context_request_fits(
+        # requested output budget does not fit. Clamp max_tokens to the
+        # remaining window minus tokenizer slack. Only a prompt that leaves
+        # no room after that slack is a true overflow.
+        _fits, estimated_prompt_tokens, context_window = context_request_fits(
             self,
             messages,
             tools=tools,
             max_tokens=requested_max_tokens,
         )
-        if not fits and context_window is not None:
-            clamped = context_window - estimated_prompt_tokens
-            if clamped >= 1:
-                requested_max_tokens = clamped
-                fits = True
+        requested_max_tokens, fits = clamp_requested_max_tokens(
+            requested_max_tokens=requested_max_tokens,
+            estimated_prompt_tokens=estimated_prompt_tokens,
+            context_window=context_window,
+        )
         body: dict[str, object] = {
             "model": self.config.model,
             "messages": [message.to_record() for message in messages],

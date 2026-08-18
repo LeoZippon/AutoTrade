@@ -17,6 +17,7 @@ from typing import Protocol
 
 _ASCII_CHARS_PER_TOKEN = 3
 _CHAT_REQUEST_FRAMING_TOKENS = 64
+CONTEXT_OUTPUT_TOKEN_MARGIN = 256
 _OPAQUE_ASCII_RUN_MIN_CHARS = 256
 _OPAQUE_ASCII_RUN = re.compile(
     rf"[A-Za-z0-9+/=_-]{{{_OPAQUE_ASCII_RUN_MIN_CHARS},}}"
@@ -310,6 +311,42 @@ def context_request_fits(
         prompt_tokens,
         window,
     )
+
+
+def clamp_requested_max_tokens(
+    *,
+    requested_max_tokens: int,
+    estimated_prompt_tokens: int,
+    context_window: int | None,
+    margin: int = CONTEXT_OUTPUT_TOKEN_MARGIN,
+) -> tuple[int, bool]:
+    """Fit the output budget into the remaining context window.
+
+    Returns ``(max_tokens, prompt_fits)``. Unknown windows leave the requested
+    budget unchanged. The margin covers host-estimate undercount so a request
+    that the estimator calls an exact fit cannot 400 the provider by one token.
+    """
+
+    if (
+        isinstance(requested_max_tokens, bool)
+        or not isinstance(requested_max_tokens, int)
+        or requested_max_tokens <= 0
+    ):
+        raise ValueError("requested_max_tokens must be a positive integer")
+    if (
+        isinstance(estimated_prompt_tokens, bool)
+        or not isinstance(estimated_prompt_tokens, int)
+        or estimated_prompt_tokens <= 0
+    ):
+        raise ValueError("estimated_prompt_tokens must be a positive integer")
+    if isinstance(margin, bool) or not isinstance(margin, int) or margin < 0:
+        raise ValueError("margin cannot be negative")
+    if context_window is None:
+        return requested_max_tokens, True
+    remaining = context_window - estimated_prompt_tokens - margin
+    if remaining < 1:
+        return requested_max_tokens, False
+    return min(requested_max_tokens, remaining), True
 
 
 def context_overflow_error(

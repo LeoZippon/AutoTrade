@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from autotrade.environment.llm import (
+    CONTEXT_OUTPUT_TOKEN_MARGIN,
     ChatMessage,
     DeepSeekConfig,
     DeepSeekProxy,
@@ -760,6 +761,30 @@ def test_local_context_estimate_keeps_long_ordinary_ascii_prompt_usable():
 
     assert proxy.complete([message], max_tokens=8_000).content == "ok"
     assert len(transport.requests) == 1
+
+
+def test_gateway_clamps_output_when_estimate_exactly_fills_the_window():
+    transport = FakeTransport([_response({"content": "ok"})])
+    proxy = OpenAICompatibleProxy(
+        OpenAICompatibleConfig(
+            api_key="local-secret",
+            provider="vllm",
+            model="qwen3.8-27b-local",
+            base_url="http://127.0.0.1:8010/v1",
+            request_dialect="vllm-qwen",
+            context_window_tokens=32_768,
+            conversation_log_dir=None,
+        ),
+        transport=transport,
+    )
+    message = ChatMessage("user", "continue after backtest")
+    prompt = estimate_chat_request_tokens([message])
+    requested = 32_768 - prompt
+    assert requested > CONTEXT_OUTPUT_TOKEN_MARGIN
+    assert proxy.complete([message], max_tokens=requested).content == "ok"
+    assert transport.requests[0][2]["max_tokens"] == (
+        requested - CONTEXT_OUTPUT_TOKEN_MARGIN
+    )
 
 
 def test_local_context_estimate_keeps_structured_json_prompts_usable():
