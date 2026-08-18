@@ -459,7 +459,6 @@ class OpenAICompatibleProxy:
         # "started" record); terminal/retry records join via call_id.
         call_id = new_id("call")
         include_next_payload = True
-        output_clamped = False
         for attempt in range(attempts):
             started_at = utc_now_iso()
             started_perf = time.perf_counter()
@@ -525,11 +524,7 @@ class OpenAICompatibleProxy:
                     http_status_code=error.status_code,
                     error=error,
                 )
-                if (
-                    not output_clamped
-                    and attempt + 1 < attempts
-                    and is_context_overflow_error(error)
-                ):
+                if attempt + 1 < attempts and is_context_overflow_error(error):
                     shrunk = max_tokens_after_provider_overflow(
                         error, requested_max_tokens=requested_max_tokens
                     )
@@ -539,7 +534,6 @@ class OpenAICompatibleProxy:
                         raw = json.dumps(
                             body, ensure_ascii=False, allow_nan=False
                         ).encode("utf-8")
-                        output_clamped = True
                         include_next_payload = True
                         continue
                 if not can_retry:
