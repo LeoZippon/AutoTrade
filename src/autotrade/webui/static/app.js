@@ -728,8 +728,45 @@ function fmtDateTick(date, withYear) {
     : `${date.slice(4, 6)}-${date.slice(6, 8)}`;
 }
 
-/* Pure renderer: the server delivers per-series {dates, cum, drawdown, final}
-   already computed from frozen run artifacts — no return math happens here. */
+function rebaseBenchmarkToStrategyWindows(seriesList) {
+  const bench = seriesList.find((s) => s.key === "benchmark");
+  const strategies = seriesList.filter((s) => s.key !== "benchmark");
+  if (!bench || !strategies.length) return seriesList;
+  const benchDates = [...bench.cum.keys()].sort();
+  const segments = [];
+  for (const strategy of strategies) {
+    const pts = strategy.dates.filter((day) => bench.cum.has(day));
+    if (!pts.length) continue;
+    const first = pts[0];
+    const prior = benchDates.indexOf(first);
+    const origin = prior > 0 ? 1 + bench.cum.get(benchDates[prior - 1]) : 1;
+    const cum = new Map();
+    const dd = new Map();
+    let peak = 0;
+    for (const day of pts) {
+      const value = (1 + bench.cum.get(day)) / origin - 1;
+      cum.set(day, value);
+      peak = Math.max(peak, 1 + value);
+      dd.set(day, (1 + value) / peak - 1);
+    }
+    const tag = CYCLE_SERIES_SHORT[strategy.key] || strategy.label;
+    segments.push({
+      ...bench,
+      key: `benchmark:${strategy.key}`,
+      label: strategies.length > 1 ? `沪深300（${tag}）` : bench.label,
+      dates: pts,
+      cum,
+      dd,
+      final: cum.get(pts[pts.length - 1]),
+      dash: "6 4",
+    });
+  }
+  return segments.length ? [...segments, ...strategies] : seriesList;
+}
+
+/* Server series are already compounded. The CSI 300 overlay is rebased to each
+   strategy window so a Held-out line that starts at 0 is compared with a 300
+   that also starts at 0 in that window. */
 function equityChart(
   payload,
   { width = 680, height = 240, ddH = 90, mini = false, keys = null } = {},
@@ -755,7 +792,7 @@ function equityChart(
   ) {
     shown.push(bench);
   }
-  const seriesList = shown.map((s) => ({
+  const mapped = shown.map((s) => ({
     key: s.key,
     label: s.label,
     final: s.final,
@@ -765,6 +802,7 @@ function equityChart(
     color: colorOf[s.key] || INK.validColor,
     dash: s.key === "benchmark" ? "6 4" : null,
   }));
+  const seriesList = rebaseBenchmarkToStrategyWindows(mapped);
   const dates = [...new Set(seriesList.flatMap((s) => s.dates))].sort();
   // Position-weight pane (EOD gross market value / equity), keyed like the
   // return series so identity carries across the linked panes.
@@ -774,7 +812,7 @@ function equityChart(
     : seriesList
         .filter(
           (s) =>
-            s.key !== "benchmark" &&
+            !String(s.key).startsWith("benchmark") &&
             exposureBy[s.key] &&
             (exposureBy[s.key].dates || []).length,
         )
