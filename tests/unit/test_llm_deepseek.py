@@ -787,15 +787,22 @@ def test_gateway_clamps_output_when_estimate_exactly_fills_the_window():
     )
 
 
-def test_gateway_retries_once_when_provider_names_output_reservation_overflow():
-    overflow = LLMProxyError(
-        "provider HTTP error 400: This model's maximum context length is 262144 tokens. "
-        "However, you requested 32768 output tokens and your prompt contains at least "
-        "229377 input tokens, for a total of at least 262145 tokens.",
+def _tautology_overflow(output: int, *, window: int = 262_144) -> LLMProxyError:
+    prompt = window + 1 - output
+    return LLMProxyError(
+        "provider HTTP error 400: This model's maximum context length is "
+        f"{window} tokens. However, you requested {output} output tokens and "
+        f"your prompt contains at least {prompt} input tokens, for a total of "
+        f"at least {window + 1} tokens.",
         retryable=False,
         status_code=400,
     )
-    transport = FakeTransport([overflow, _response({"content": "ok"})])
+
+
+def test_gateway_halves_output_when_provider_overflow_is_tautological():
+    transport = FakeTransport(
+        [_tautology_overflow(32_768), _response({"content": "ok"})]
+    )
     proxy = OpenAICompatibleProxy(
         OpenAICompatibleConfig(
             api_key="local-secret",
@@ -804,46 +811,7 @@ def test_gateway_retries_once_when_provider_names_output_reservation_overflow():
             base_url="http://127.0.0.1:8010/v1",
             request_dialect="vllm-qwen",
             context_window_tokens=262_144,
-            max_retries=2,
-            conversation_log_dir=None,
-        ),
-        transport=transport,
-    )
-    assert (
-        proxy.complete([ChatMessage("user", "meta")], max_tokens=32_768).content
-        == "ok"
-    )
-    assert transport.requests[0][2]["max_tokens"] == 32_768
-    assert transport.requests[1][2]["max_tokens"] == (
-        262_144 - 229_377 - CONTEXT_OUTPUT_TOKEN_MARGIN
-    )
-
-
-def test_gateway_keeps_shrinking_output_when_provider_prompt_count_rises():
-    first = LLMProxyError(
-        "provider HTTP error 400: This model's maximum context length is 262144 tokens. "
-        "However, you requested 32768 output tokens and your prompt contains at least "
-        "229377 input tokens, for a total of at least 262145 tokens.",
-        retryable=False,
-        status_code=400,
-    )
-    second = LLMProxyError(
-        "provider HTTP error 400: This model's maximum context length is 262144 tokens. "
-        "However, you requested 30462 output tokens and your prompt contains at least "
-        "229634 input tokens, for a total of at least 260096 tokens.",
-        retryable=False,
-        status_code=400,
-    )
-    transport = FakeTransport([first, second, _response({"content": "ok"})])
-    proxy = OpenAICompatibleProxy(
-        OpenAICompatibleConfig(
-            api_key="local-secret",
-            provider="vllm",
-            model="qwen3.8-27b-local",
-            base_url="http://127.0.0.1:8010/v1",
-            request_dialect="vllm-qwen",
-            context_window_tokens=262_144,
-            max_retries=2,
+            max_retries=0,
             conversation_log_dir=None,
         ),
         transport=transport,
@@ -854,8 +822,39 @@ def test_gateway_keeps_shrinking_output_when_provider_prompt_count_rises():
     )
     assert [request[2]["max_tokens"] for request in transport.requests] == [
         32_768,
-        262_144 - 229_377 - CONTEXT_OUTPUT_TOKEN_MARGIN,
-        262_144 - 229_634 - CONTEXT_OUTPUT_TOKEN_MARGIN,
+        16_384,
+    ]
+
+
+def test_gateway_keeps_halving_output_on_repeated_tautological_overflow():
+    transport = FakeTransport(
+        [
+            _tautology_overflow(32_768),
+            _tautology_overflow(16_384),
+            _response({"content": "ok"}),
+        ]
+    )
+    proxy = OpenAICompatibleProxy(
+        OpenAICompatibleConfig(
+            api_key="local-secret",
+            provider="vllm",
+            model="qwen3.8-27b-local",
+            base_url="http://127.0.0.1:8010/v1",
+            request_dialect="vllm-qwen",
+            context_window_tokens=262_144,
+            max_retries=0,
+            conversation_log_dir=None,
+        ),
+        transport=transport,
+    )
+    assert (
+        proxy.complete([ChatMessage("user", "meta")], max_tokens=32_768).content
+        == "ok"
+    )
+    assert [request[2]["max_tokens"] for request in transport.requests] == [
+        32_768,
+        16_384,
+        8_192,
     ]
 
 

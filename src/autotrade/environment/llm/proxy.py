@@ -18,6 +18,8 @@ from typing import Protocol
 _ASCII_CHARS_PER_TOKEN = 3
 _CHAT_REQUEST_FRAMING_TOKENS = 64
 CONTEXT_OUTPUT_TOKEN_MARGIN = 2_048
+CONTEXT_OUTPUT_MIN_TOKENS = 256
+CONTEXT_OUTPUT_MAX_SHRINKS = 8
 _OPAQUE_ASCII_RUN_MIN_CHARS = 256
 _OPAQUE_ASCII_RUN = re.compile(
     rf"[A-Za-z0-9+/=_-]{{{_OPAQUE_ASCII_RUN_MIN_CHARS},}}"
@@ -405,9 +407,18 @@ def max_tokens_after_provider_overflow(
     if isinstance(margin, bool) or not isinstance(margin, int) or margin < 0:
         raise ValueError("margin cannot be negative")
     match = _PROVIDER_OUTPUT_OVERFLOW.search(str(exc))
-    if match is None:
-        return None
-    remaining = int(match["window"]) - int(match["prompt"]) - margin
-    if remaining < 1 or remaining >= requested_max_tokens:
-        return None
-    return remaining
+    if match is not None:
+        window = int(match["window"])
+        prompt = int(match["prompt"])
+        output = int(match["output"])
+        # vLLM's "prompt contains at least" is often window + 1 - requested
+        # output, not a measured prompt size. Only trust it when it is not
+        # that identity.
+        if prompt + output != window + 1:
+            remaining = window - prompt - margin
+            if remaining >= CONTEXT_OUTPUT_MIN_TOKENS and remaining < requested_max_tokens:
+                return remaining
+    halved = requested_max_tokens // 2
+    if halved >= CONTEXT_OUTPUT_MIN_TOKENS:
+        return halved
+    return None

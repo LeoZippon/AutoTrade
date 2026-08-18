@@ -34,6 +34,7 @@ from .proxy import (
     LLMProxyError,
     ProviderResponse,
     ToolCall,
+    CONTEXT_OUTPUT_MAX_SHRINKS,
     clamp_requested_max_tokens,
     context_overflow_error,
     context_request_fits,
@@ -459,7 +460,11 @@ class OpenAICompatibleProxy:
         # "started" record); terminal/retry records join via call_id.
         call_id = new_id("call")
         include_next_payload = True
-        for attempt in range(attempts):
+        network_attempt = 0
+        shrinks = 0
+        post_index = 0
+        while True:
+            post_index += 1
             started_at = utc_now_iso()
             started_perf = time.perf_counter()
             log_path = self._conversation_log_path(started_at)
@@ -473,7 +478,7 @@ class OpenAICompatibleProxy:
                     started_at=started_at,
                     completed_at=None,
                     duration_seconds=0.0,
-                    attempt=attempt + 1,
+                    attempt=post_index,
                     max_attempts=attempts,
                     status="started",
                     call_id=call_id,
@@ -503,28 +508,23 @@ class OpenAICompatibleProxy:
             # pi-lens-ignore: ast-grep:no-boolean-in-except
             except (LLMProxyError, OSError, RuntimeError, TypeError, ValueError) as exc:
                 error = self._normalize_error(exc)
-                retry_delay = self.config.retry_backoff_seconds * (2**attempt)
-                can_retry = error.retryable and attempt + 1 < attempts
-                if can_retry and call_deadline - time.monotonic() <= retry_delay:
-                    error = LLMProxyError(
-                        "provider call hard deadline exhausted before retry",
-                        retryable=True,
-                        status_code=error.status_code,
-                    )
-                    can_retry = False
                 self._log_attempt(
                     log_path,
                     body,
                     started_at=started_at,
                     started_perf=started_perf,
-                    attempt=attempt + 1,
+                    attempt=post_index,
                     max_attempts=attempts,
                     status="error",
                     call_id=call_id,
                     http_status_code=error.status_code,
                     error=error,
                 )
-                if attempt + 1 < attempts and is_context_overflow_error(error):
+                if (
+                    fits
+                    and shrinks < CONTEXT_OUTPUT_MAX_SHRINKS
+                    and is_context_overflow_error(error)
+                ):
                     shrunk = max_tokens_after_provider_overflow(
                         error, requested_max_tokens=requested_max_tokens
                     )
@@ -534,10 +534,21 @@ class OpenAICompatibleProxy:
                         raw = json.dumps(
                             body, ensure_ascii=False, allow_nan=False
                         ).encode("utf-8")
+                        shrinks += 1
                         include_next_payload = True
                         continue
+                retry_delay = self.config.retry_backoff_seconds * (2**network_attempt)
+                can_retry = error.retryable and network_attempt + 1 < attempts
+                if can_retry and call_deadline - time.monotonic() <= retry_delay:
+                    error = LLMProxyError(
+                        "provider call hard deadline exhausted before retry",
+                        retryable=True,
+                        status_code=error.status_code,
+                    )
+                    can_retry = False
                 if not can_retry:
                     raise error from None
+                network_attempt += 1
                 if retry_delay:
                     self._sleep(retry_delay)
                 if time.monotonic() >= call_deadline:
@@ -551,7 +562,7 @@ class OpenAICompatibleProxy:
                 body,
                 started_at=started_at,
                 started_perf=started_perf,
-                attempt=attempt + 1,
+                attempt=post_index,
                 max_attempts=attempts,
                 status="ok",
                 call_id=call_id,
@@ -561,7 +572,6 @@ class OpenAICompatibleProxy:
                 else payload.decode("utf-8", "replace"),
             )
             return response
-        raise LLMProxyError("provider request failed")
 
     def _log_attempt(
         self,
