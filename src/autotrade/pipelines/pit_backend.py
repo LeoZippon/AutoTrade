@@ -513,17 +513,16 @@ class PITDailyEvaluationBackend:
             }
             target = result_dir / "result.json"
             write_json_atomic(target, record)
-            if request.mode == "valid":
-                write_style_rollup(
-                    result_dir,
-                    replay_style_analysis(
-                        replay,
-                        daily,
-                        replay_dir=replay_dir,
-                        snapshot_dir=snapshot_dir,
-                        mode=request.mode,
-                    ),
-                )
+            write_style_rollup(
+                result_dir,
+                replay_style_analysis(
+                    replay,
+                    daily,
+                    replay_dir=replay_dir,
+                    snapshot_dir=snapshot_dir,
+                    mode=request.mode,
+                ),
+            )
             summary = record.get("stats")
             if not isinstance(summary, dict):
                 raise TypeError("daily replay omitted stats")

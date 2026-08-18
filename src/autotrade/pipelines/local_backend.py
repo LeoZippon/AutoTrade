@@ -161,11 +161,17 @@ class LocalDailyEvaluationBackend:
             raise ValueError(f"unsupported local evaluation mode: {request.mode}")
         strategy_path = Path(request.revision.output_path) / "main.py"
         if not strategy_path.is_file():
-            raise FileNotFoundError(f"strategy revision has no main.py: {strategy_path}")
-        validate_strategy_source(strategy_path.read_text(encoding="utf-8"), filename="main.py")
+            raise FileNotFoundError(
+                f"strategy revision has no main.py: {strategy_path}"
+            )
+        validate_strategy_source(
+            strategy_path.read_text(encoding="utf-8"), filename="main.py"
+        )
         frame = self.frame_between(request.start, request.end)
         if frame.empty:
-            raise ValueError(f"daily replay is empty for {request.start}..{request.end}")
+            raise ValueError(
+                f"daily replay is empty for {request.start}..{request.end}"
+            )
         config = StrategyExperimentConfig(
             strategy_path=strategy_path,
             schedule=request.schedule,
@@ -181,20 +187,22 @@ class LocalDailyEvaluationBackend:
         target = self.results_root / result_id / "result.json"
         target.parent.mkdir(parents=True, exist_ok=False)
         target.write_text(
-            json.dumps(record, ensure_ascii=False, allow_nan=False, default=str, indent=2) + "\n",
+            json.dumps(
+                record, ensure_ascii=False, allow_nan=False, default=str, indent=2
+            )
+            + "\n",
             encoding="utf-8",
         )
-        if request.mode == "valid":
-            write_style_rollup(
-                target.parent,
-                replay_style_analysis(
-                    replay,
-                    frame,
-                    replay_dir=None,
-                    snapshot_dir=None,
-                    mode=request.mode,
-                ),
-            )
+        write_style_rollup(
+            target.parent,
+            replay_style_analysis(
+                replay,
+                frame,
+                replay_dir=None,
+                snapshot_dir=None,
+                mode=request.mode,
+            ),
+        )
         summary = record.get("stats")
         if not isinstance(summary, dict):
             raise TypeError("daily replay omitted stats")
@@ -229,10 +237,14 @@ class DeterministicBaselineDeveloper:
         shutil.copy2(self.baseline_strategy, self.baseline_root / "main.py")
 
     def __call__(self, request: FoldSessionRequest) -> FoldSessionResult:
-        source = request.parent.path if request.parent is not None else self.baseline_root
+        source = (
+            request.parent.path if request.parent is not None else self.baseline_root
+        )
         revision = self.artifact_store.create_revision(
             source,
-            models_path=request.parent.model_path if request.parent is not None else None,
+            models_path=request.parent.model_path
+            if request.parent is not None
+            else None,
         )
         typed_revision = ArtifactRevision(
             str(revision.revision_id),
@@ -252,10 +264,16 @@ class DeterministicBaselineDeveloper:
         )
         # Step ids reach the Agent through the ledger's steps[] projection, so
         # they carry the same opaque fold ref every agent-visible surface uses.
-        step_id = f"baseline_{agent_visible_ref(request.fold.fold_id, prefix='fold_ref')}"
+        step_id = (
+            f"baseline_{agent_visible_ref(request.fold.fold_id, prefix='fold_ref')}"
+        )
         return FoldSessionResult(
             conversation_id=f"deterministic_baseline_{request.run_id}",
-            steps=(StepResult(step_id, typed_revision.revision_id, validation, selected=True),),
+            steps=(
+                StepResult(
+                    step_id, typed_revision.revision_id, validation, selected=True
+                ),
+            ),
             selected_step_id=step_id,
             finish_reason="deterministic_baseline_replay_no_agent_improvement",
         )
@@ -306,7 +324,9 @@ class SessionBudgetLLM(SessionTimeBudgetAware):
     ) -> None:
         if budget is None:
             if max_calls is None or deadline is None:
-                raise ValueError("max_calls and deadline are required without a shared budget")
+                raise ValueError(
+                    "max_calls and deadline are required without a shared budget"
+                )
             budget = SessionCallBudget(max_calls=max_calls, deadline=deadline)
         self.delegate = delegate
         self.budget = budget
@@ -361,7 +381,12 @@ class FoldBacktestTool(SessionTimeBudgetAware):
     spec = ToolSpec(
         "daily_backtest",
         "Commit the current output as an immutable revision and run the Fold Validation replay.",
-        {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
+        {
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": False,
+        },
     )
 
     def __init__(
@@ -434,7 +459,9 @@ class FoldBacktestTool(SessionTimeBudgetAware):
                 typed = ArtifactRevision(
                     revision_id,
                     Path(revision.output_path),
-                    Path(revision.models_path) if revision.models_path is not None else None,
+                    Path(revision.models_path)
+                    if revision.models_path is not None
+                    else None,
                 )
                 evaluation = self.evaluator.evaluate(
                     EvaluationRequest(
@@ -454,7 +481,9 @@ class FoldBacktestTool(SessionTimeBudgetAware):
                     # Opaque the fold id so the step-tree node names the Agent
                     # reads (steps/tree.txt|tree.json) never leak the held-out
                     # calendar period.
-                    fold_id=agent_visible_ref(self.request.fold.fold_id, prefix="fold_ref"),
+                    fold_id=agent_visible_ref(
+                        self.request.fold.fold_id, prefix="fold_ref"
+                    ),
                     run_id=self.request.run_id,
                     result_name=result_name,
                     revision_id=revision_id,
@@ -469,7 +498,9 @@ class FoldBacktestTool(SessionTimeBudgetAware):
             if self.request.record_failed_attempts:
                 self.tree.record_failed_attempt(
                     epoch_id=self.request.epoch_id,
-                    fold_id=agent_visible_ref(self.request.fold.fold_id, prefix="fold_ref"),
+                    fold_id=agent_visible_ref(
+                        self.request.fold.fold_id, prefix="fold_ref"
+                    ),
                     run_id=self.request.run_id,
                     result_name=result_name,
                     error=f"{type(exc).__name__}: {exc}",
@@ -535,7 +566,9 @@ class WriteTasteTool:
         "Write the sole Meta output as taste.md.",
         {
             "type": "object",
-            "properties": {"taste": {"type": "string", "minLength": 1, "maxLength": 20_000}},
+            "properties": {
+                "taste": {"type": "string", "minLength": 1, "maxLength": 20_000}
+            },
             "required": ["taste"],
             "additionalProperties": False,
         },
@@ -594,7 +627,10 @@ class LLMFoldDeveloper:
         self.explore_max_tokens = explore_max_tokens
         self.step_tree_enabled = step_tree_enabled
         self.fold_exploration_directive = fold_exploration_directive
-        validate_strategy_source(self.baseline_strategy.read_text(encoding="utf-8"), filename=self.baseline_strategy.name)
+        validate_strategy_source(
+            self.baseline_strategy.read_text(encoding="utf-8"),
+            filename=self.baseline_strategy.name,
+        )
 
     def set_sandbox_spec(self, spec: SandboxSpec) -> None:
         """Adopt the derived image a Meta session just built, for later Folds."""
@@ -662,13 +698,19 @@ class LLMFoldDeveloper:
                 },
                 "fold_period": request.fold_period,
                 "snapshot_config": dict(request.snapshot_config),
-                "snapshots": {"valid_decision_input": {"snapshot_id": request.snapshot.snapshot_id}},
+                "snapshots": {
+                    "valid_decision_input": {
+                        "snapshot_id": request.snapshot.snapshot_id
+                    }
+                },
                 "valid_decision_time": request.fold.valid_decision_time.isoformat(),
                 "is_initial_artifact": request.parent is None,
                 "parent_strategy_artifact_id": (
                     request.parent.artifact_id if request.parent is not None else None
                 ),
-                "template_ref": None if request.parent is not None else "agent_output_template",
+                "template_ref": None
+                if request.parent is not None
+                else "agent_output_template",
                 "modification_constraints": request.modification_constraints.to_record(),
                 "acceptance_rules": dict(request.acceptance_rules),
                 "schedule": self.schedule.to_record(),
@@ -697,10 +739,18 @@ class LLMFoldDeveloper:
         output_dir = workspace_root / "output"
         models_dir = workspace_root / "models"
         inputs_dir = workspace_root / "inputs"
-        source = request.parent.path if request.parent is not None else self.baseline_strategy.parent
-        source_models = request.parent.model_path if request.parent is not None else None
+        source = (
+            request.parent.path
+            if request.parent is not None
+            else self.baseline_strategy.parent
+        )
+        source_models = (
+            request.parent.model_path if request.parent is not None else None
+        )
         if request.parent is None and self.baseline_strategy.name != "main.py":
-            raise ValueError("baseline strategy file must be named main.py for Fold development")
+            raise ValueError(
+                "baseline strategy file must be named main.py for Fold development"
+            )
         copy_artifact(source, output_dir)
         copy_model_artifacts(source_models, models_dir)
         restore_working_artifacts_writable(output_dir, models_dir)
@@ -729,11 +779,16 @@ class LLMFoldDeveloper:
             if self.command_runner_factory is not None:
                 command_runner = self.command_runner_factory(workspace_root)
             else:
-                _environment_phase(request.progress_hook, "sandbox_start", request.run_id)
+                _environment_phase(
+                    request.progress_hook, "sandbox_start", request.run_id
+                )
                 sandbox = DockerSandbox(
                     local,
                     sandbox_spec,
-                    labels={"adm.experiment": request.experiment_id, "adm.run": request.run_id},
+                    labels={
+                        "adm.experiment": request.experiment_id,
+                        "adm.run": request.run_id,
+                    },
                 )
                 sandbox.start()
                 command_runner = PersistentCommandRunner(sandbox)
@@ -769,9 +824,7 @@ class LLMFoldDeveloper:
                 parent_models_dir=source_models,
                 constraints=request.modification_constraints,
             )
-            time_budget = InferenceTimeBudget(
-                duration_seconds=request.deadline_seconds
-            )
+            time_budget = InferenceTimeBudget(duration_seconds=request.deadline_seconds)
             shared_budget = SessionCallBudget(
                 max_calls=request.max_llm_calls,
                 time_budget=time_budget,
@@ -871,7 +924,9 @@ class LLMFoldDeveloper:
                 ),
                 explore=explore,
                 time_budget=time_budget,
-                event_sink=_agent_event_sink(trace, request.progress_hook, request.run_id),
+                event_sink=_agent_event_sink(
+                    trace, request.progress_hook, request.run_id
+                ),
             )
             result = runner.run(self._fold_instruction(request))
             selected_node = str(result.finish_value.get("node_id") or "")
@@ -888,8 +943,12 @@ class LLMFoldDeveloper:
                 for step in backtest.steps
             )
             if selected_revision not in {step.revision_id for step in steps}:
-                raise RuntimeError("finish_fold selected a revision absent from this Fold result")
-            manifest.update(conversation_id=result.conversation_id, selected_step_id=selected_node)
+                raise RuntimeError(
+                    "finish_fold selected a revision absent from this Fold result"
+                )
+            manifest.update(
+                conversation_id=result.conversation_id, selected_step_id=selected_node
+            )
             if self.step_tree_enabled and paths.steps.exists():
                 link_copytree(paths.steps, self.experiment_dir / "steps")
             collected = local.collect_artifacts(
@@ -928,7 +987,9 @@ class LLMFoldDeveloper:
             link_copytree(experiment_tree, paths.steps)
         tree = StepTree(paths.steps)
         if self.step_tree_enabled:
-            tree.set_position(tree.position_for_step(parent.source_step_id) if parent else None)
+            tree.set_position(
+                tree.position_for_step(parent.source_step_id) if parent else None
+            )
         return tree
 
     def _install_snapshot_view(
@@ -946,7 +1007,9 @@ class LLMFoldDeveloper:
         elif source.is_file():
             frame_between = getattr(self.evaluator, "frame_between", None)
             if not callable(frame_between):
-                raise TypeError("file-backed snapshot requires an evaluator with frame_between")
+                raise TypeError(
+                    "file-backed snapshot requires an evaluator with frame_between"
+                )
             visible = frame_between(start, end)
             if not isinstance(visible, pd.DataFrame) or visible.empty:
                 raise ValueError(f"Agent daily view is empty for {start}..{end}")
@@ -963,7 +1026,9 @@ class LLMFoldDeveloper:
             )
             chmod_tree(target, file_mode=0o444, dir_mode=0o555)
         else:  # pragma: no cover - resolve(strict=True) already rejects this
-            raise ValueError(f"snapshot decision_ref is neither a file nor directory: {source}")
+            raise ValueError(
+                f"snapshot decision_ref is neither a file nor directory: {source}"
+            )
         write_agent_data_summary(
             local.paths.data_summary,
             kind="fold",
@@ -1015,7 +1080,13 @@ class LLMFoldDeveloper:
                 "data_summary": "/mnt/artifacts/data_summary.json",
                 "snapshot_in_sandbox": "/mnt/snapshot",
             },
-            "forbidden": ["current_test", "future_data", "heldout", "external_network", "host_control"],
+            "forbidden": [
+                "current_test",
+                "future_data",
+                "heldout",
+                "external_network",
+                "host_control",
+            ],
         }
 
     @staticmethod
@@ -1078,7 +1149,9 @@ class LLMMetaLearner:
         self.fold_exploration_directive = fold_exploration_directive
         # The limits a Meta regularization must satisfy before the Pipeline will
         # freeze it; published in the run manifest and enforced by the check.
-        self.regularization_constraints = regularization_constraints or ModificationConstraints()
+        self.regularization_constraints = (
+            regularization_constraints or ModificationConstraints()
+        )
 
     def __call__(self, facts: dict[str, object]) -> MetaSessionResult:
         from autotrade.agent.compact import ContextCompactor
@@ -1128,7 +1201,9 @@ class LLMMetaLearner:
         if parent_id:
             if Path(parent_id).name != parent_id or parent_id.startswith("."):
                 raise ValueError("parent_artifact_id must be one local path component")
-            parent_root = (self.artifact_store.frozen_root / parent_id).resolve(strict=True)
+            parent_root = (self.artifact_store.frozen_root / parent_id).resolve(
+                strict=True
+            )
             if not parent_root.is_relative_to(self.artifact_store.frozen_root):
                 raise ValueError("parent artifact escaped the configured store")
             parent = (parent_root / "output").resolve(strict=True)
@@ -1148,7 +1223,8 @@ class LLMMetaLearner:
         public = {
             key: value
             for key, value in facts.items()
-            if key not in {"user_question_hook", "progress_hook", "meta_learning_memory"}
+            if key
+            not in {"user_question_hook", "progress_hook", "meta_learning_memory"}
         }
         if parent_id:
             public["parent_artifact_id"] = agent_visible_ref(
@@ -1160,9 +1236,15 @@ class LLMMetaLearner:
         # long. Empty memory still writes the file so a first Epoch reads an
         # empty one instead of guessing.
         memory_path = inputs / "meta_learning_memory.jsonl"
-        memory_path.write_text(str(facts.get("meta_learning_memory") or ""), encoding="utf-8")
+        memory_path.write_text(
+            str(facts.get("meta_learning_memory") or ""), encoding="utf-8"
+        )
         chmod_tree(inputs, file_mode=0o444, dir_mode=0o555)
-        visible_fold = public.get("visible_fold") if isinstance(public.get("visible_fold"), dict) else {}
+        visible_fold = (
+            public.get("visible_fold")
+            if isinstance(public.get("visible_fold"), dict)
+            else {}
+        )
         manifest = RunManifest.create(
             paths.run_manifest,
             {
@@ -1195,7 +1277,9 @@ class LLMMetaLearner:
                     "meta_learning_memory": "/mnt/agent/workspace/inputs/meta_learning_memory.jsonl",
                     "strategy_working_copy": "/mnt/agent/workspace/output",
                     "model_working_copy": "/mnt/agent/workspace/models",
-                    "previous_taste": bool(str(public.get("previous_taste") or "").strip()),
+                    "previous_taste": bool(
+                        str(public.get("previous_taste") or "").strip()
+                    ),
                 },
                 "taste_output": "/mnt/agent/workspace/taste.md",
                 "modification_constraints": replace(
@@ -1209,9 +1293,7 @@ class LLMMetaLearner:
                 },
             },
         )
-        time_budget = InferenceTimeBudget(
-            duration_seconds=self.deadline_seconds
-        )
+        time_budget = InferenceTimeBudget(duration_seconds=self.deadline_seconds)
         shared_budget = SessionCallBudget(
             max_calls=self.max_llm_calls,
             time_budget=time_budget,
@@ -1254,8 +1336,12 @@ class LLMMetaLearner:
         tools.append(
             TasteFinishTool(safe, window_dates=visible_window_dates(manifest.data))
         )
-        instruction = str(public.get("prompt_override") or "").strip() or build_meta_learning_prompt(
-            public.get("development_history") if isinstance(public.get("development_history"), dict) else {},
+        instruction = str(
+            public.get("prompt_override") or ""
+        ).strip() or build_meta_learning_prompt(
+            public.get("development_history")
+            if isinstance(public.get("development_history"), dict)
+            else {},
             str(public.get("previous_taste") or ""),
             experiment_directive=self.meta_learning_directive,
             fold_exploration_directive=self.fold_exploration_directive,
@@ -1299,9 +1385,12 @@ class LLMMetaLearner:
             revision_id = ""
             if parent_id and allowed and _check_has_changes(check):
                 validate_strategy_source(
-                    (output_dir / "main.py").read_text(encoding="utf-8"), filename="main.py"
+                    (output_dir / "main.py").read_text(encoding="utf-8"),
+                    filename="main.py",
                 )
-                revision = self.artifact_store.create_revision(output_dir, models_path=models_dir)
+                revision = self.artifact_store.create_revision(
+                    output_dir, models_path=models_dir
+                )
                 revision_id = str(revision.revision_id)
             _environment_phase(progress_hook, "environment_update", run_id)
             rebuild_error: RuntimeError | None = None
@@ -1321,7 +1410,10 @@ class LLMMetaLearner:
             except RuntimeError as exc:
                 rebuild_error = exc
             else:
-                if active_spec is not self.sandbox_spec and self.sandbox_spec_sink is not None:
+                if (
+                    active_spec is not self.sandbox_spec
+                    and self.sandbox_spec_sink is not None
+                ):
                     self.sandbox_spec_sink(active_spec)
             # Collect first, then fail: the Taste and the rebuild record must
             # survive a rebuild failure.
@@ -1362,14 +1454,18 @@ def _agent_event_sink(
     def emit(event_type: str, payload: dict[str, object]) -> None:
         trace.emit(
             event_type,
-            payload if include_content else _safe_meta_trace_payload(event_type, payload),
+            payload
+            if include_content
+            else _safe_meta_trace_payload(event_type, payload),
         )
         if progress_hook is None:
             return
         if event_type == "llm_call_started":
             stage = "llm_call"
         elif event_type == "tool_call_started":
-            stage = "backtest" if payload.get("tool") == "daily_backtest" else "tool_call"
+            stage = (
+                "backtest" if payload.get("tool") == "daily_backtest" else "tool_call"
+            )
         elif event_type == "session_end":
             stage = "agent_complete"
         else:
@@ -1404,7 +1500,9 @@ def _safe_meta_trace_payload(
     return {key: value for key, value in payload.items() if key in allowed}
 
 
-def _finalize_modification_check(tool: ModificationCheckTool) -> tuple[dict[str, object], bool]:
+def _finalize_modification_check(
+    tool: ModificationCheckTool,
+) -> tuple[dict[str, object], bool]:
     """Run the post-session check, turning a refusal into an audited verdict.
 
     A Meta session that leaves the artifact outside its constraints must not

@@ -601,6 +601,86 @@ def test_active_experiment_api_hides_historical_steps_analysis_and_reports(
     assert client.get("/api/experiments/demo/reports/download").status_code == 404
 
 
+def test_revealed_equity_includes_test_and_heldout_csi300(tmp_path: Path):
+    directory = _persistent_experiment(tmp_path)
+    test_dir = directory / "artifacts/results/frozen_test_001"
+    test_dir.mkdir()
+    test_dir.joinpath("result.json").write_text(
+        json.dumps(
+            {
+                "equity_curve": [
+                    {
+                        "trade_date": "20260202",
+                        "initial_equity": 1_000_000,
+                        "equity": 1_030_000,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    test_dir.joinpath("style_analysis.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "mode": "frozen_test",
+                "benchmark_daily": [["20260202", 0.004]],
+            }
+        ),
+        encoding="utf-8",
+    )
+    heldout_dir = directory / "artifacts/results/heldout_001"
+    heldout_dir.mkdir()
+    heldout_dir.joinpath("result.json").write_text(
+        json.dumps(
+            {
+                "equity_curve": [
+                    {
+                        "trade_date": "20260504",
+                        "initial_equity": 1_000_000,
+                        "equity": 990_000,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    heldout_dir.joinpath("style_analysis.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "mode": "heldout",
+                "benchmark_daily": [["20260504", -0.001]],
+            }
+        ),
+        encoding="utf-8",
+    )
+    ledger = ExperimentLedger(directory / "ledgers/experiment_ledger.jsonl")
+    fold = json.loads(ledger.path.read_text(encoding="utf-8").splitlines()[0])
+    fold["test_result_ref"] = str(test_dir / "result.json")
+    ledger.path.write_text(json.dumps(fold) + "\n", encoding="utf-8")
+    ledger.append(
+        {
+            "record_type": "heldout",
+            "experiment_id": "demo",
+            "epoch_id": "epoch_001",
+            "fold_id": "heldout_2026Q2",
+            "run_id": "run_heldout",
+            "result_ref": str(heldout_dir / "result.json"),
+            "result": {"total_return": -0.01},
+        }
+    )
+    write_control(directory / "hitl/control.json", ControlState(mode="manual", test_revealed=True))
+    client = TestClient(create_app(tmp_path))
+    curve = client.get("/api/experiments/demo/equity").json()
+    assert set(curve["benchmark"]["dates"]) == {"20260102", "20260105", "20260202", "20260504"}
+    fold_curve = client.get(
+        "/api/experiments/demo/folds/epoch_001/fold_2026Q1/equity"
+    ).json()
+    assert set(fold_curve["benchmark"]["dates"]) == {"20260102", "20260105", "20260202"}
+    assert {series["key"] for series in curve["series"]} >= {"valid", "test", "heldout"}
+
+
 def test_experiment_progress_comes_from_schedule_and_durable_ledger(tmp_path: Path):
     directory = _persistent_experiment(tmp_path)
     client = TestClient(create_app(tmp_path))
@@ -1520,8 +1600,9 @@ class WebuiBackendTest(unittest.TestCase):
             directory = results / prefix
             directory.mkdir(parents=True, exist_ok=True)
             (directory / "result.json").write_text("{}", encoding="utf-8")
+            style_mode = "frozen_test" if prefix.startswith("test") else prefix.split("_")[0]
             (directory / "style_analysis.json").write_text(
-                json.dumps({"schema_version": 1, "mode": prefix.split("_")[0]}),
+                json.dumps({"schema_version": 1, "mode": style_mode}),
                 encoding="utf-8",
             )
         record_path = (
@@ -1551,7 +1632,7 @@ class WebuiBackendTest(unittest.TestCase):
         self._reveal()
         revealed = self.client.get(url, params={"run_id": "run_001", "prefix": "test"})
         self.assertEqual(revealed.status_code, 200, revealed.text)
-        self.assertEqual(revealed.json()["mode"], "test")
+        self.assertEqual(revealed.json()["mode"], "frozen_test")
 
     def test_fold_orders_gated_until_reveal(self) -> None:
         results = (

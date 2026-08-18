@@ -520,7 +520,10 @@ def test_llm_worker_runs_real_meta_fold_validation_and_heldout(
     )
     assert style["schema_version"] == 1 and style["mode"] == "valid"
     assert style["benchmark_regression"]["available"] is False
-    assert not (Path(heldout["result_ref"]).parent / "style_analysis.json").exists()
+    heldout_style = json.loads(
+        (Path(heldout["result_ref"]).parent / "style_analysis.json").read_text(encoding="utf-8")
+    )
+    assert heldout_style["schema_version"] == 1 and heldout_style["mode"] == "heldout"
     api_style = TestClient(create_app(repo)).get(
         "/api/experiments/smoke/style",
         params={"run_id": fold["run_id"], "prefix": "valid"},

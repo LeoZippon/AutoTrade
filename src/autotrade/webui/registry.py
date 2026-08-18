@@ -681,7 +681,8 @@ def style_payload(
         payload = read_json(sidecar)
     except (OSError, ValueError) as exc:
         raise KeyError("该运行没有已落盘的风格归因结果") from exc
-    if payload.get("schema_version") != STYLE_SCHEMA_VERSION or payload.get("mode") != prefix:
+    expected_mode = {"valid": "valid", "test": "frozen_test", "heldout": "heldout"}[prefix]
+    if payload.get("schema_version") != STYLE_SCHEMA_VERSION or payload.get("mode") != expected_mode:
         raise KeyError("该运行没有已落盘的风格归因结果")
     return payload
 

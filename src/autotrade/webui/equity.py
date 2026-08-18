@@ -12,6 +12,7 @@ from autotrade.environment.replay.style import (
     BENCHMARK_LABEL,
     STYLE_ARTIFACT_NAME,
     STYLE_SCHEMA_VERSION,
+    _slot_benchmark,
 )
 from autotrade.pipelines.ledger import latest_fold_records, latest_heldout_records
 
@@ -111,34 +112,61 @@ def _exposure_entry(rows: list[tuple[str, float]]) -> dict[str, object]:
     return {"dates": [row[0] for row in rows], "long": [row[1] for row in rows]}
 
 
+_STYLE_MODES = frozenset({"valid", "frozen_test", "heldout"})
+
+
 def _benchmark_returns(experiment_dir: Path, reference: object) -> list[tuple[str, float]]:
     result_file = _result_file(experiment_dir, reference)
     if result_file is None:
         return []
     sidecar = (result_file.parent / STYLE_ARTIFACT_NAME).resolve()
-    if not sidecar.is_relative_to(experiment_dir.resolve()) or not sidecar.is_file():
-        return []
+    if sidecar.is_relative_to(experiment_dir.resolve()) and sidecar.is_file():
+        try:
+            payload = json.loads(sidecar.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            payload = None
+        if (
+            isinstance(payload, Mapping)
+            and payload.get("schema_version") == STYLE_SCHEMA_VERSION
+            and payload.get("mode") in _STYLE_MODES
+        ):
+            rows = payload.get("benchmark_daily")
+            result: dict[str, float] = {}
+            if isinstance(rows, list):
+                for item in rows:
+                    if not isinstance(item, list) or len(item) != 2:
+                        continue
+                    value = _finite(item[1])
+                    if item[0] and value is not None:
+                        result.setdefault(str(item[0]), value)
+            if result:
+                return sorted(result.items())
+    return _benchmark_from_replay_slot(experiment_dir, result_file)
+
+
+def _benchmark_from_replay_slot(
+    experiment_dir: Path, result_file: Path
+) -> list[tuple[str, float]]:
+    """Older frozen-test / Held-out dirs have no style sidecar; recover CSI 300
+    from the replay slot named in the result PIT block."""
     try:
-        payload = json.loads(sidecar.read_text(encoding="utf-8"))
+        payload = json.loads(result_file.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return []
-    if (
-        not isinstance(payload, Mapping)
-        or payload.get("schema_version") != STYLE_SCHEMA_VERSION
-        or payload.get("mode") != "valid"
-    ):
+    replay_ref = payload.get("pit") if isinstance(payload, Mapping) else None
+    replay_dir = replay_ref.get("replay_ref") if isinstance(replay_ref, Mapping) else None
+    if not isinstance(replay_dir, str) or not replay_dir:
         return []
-    rows = payload.get("benchmark_daily")
-    if not isinstance(rows, list):
+    raw = Path(replay_dir)
+    slot = raw.resolve() if raw.is_absolute() else (experiment_dir / raw).resolve()
+    if not slot.is_relative_to(experiment_dir.resolve()):
         return []
-    result: dict[str, float] = {}
-    for item in rows:
-        if not isinstance(item, list) or len(item) != 2:
-            continue
-        value = _finite(item[1])
-        if item[0] and value is not None:
-            result.setdefault(str(item[0]), value)
-    return sorted(result.items())
+    bench = _slot_benchmark(slot)
+    if not bench:
+        return []
+    days = [day for day, _value, _initial in _equities(experiment_dir, str(result_file))]
+    wanted = days or sorted(bench)
+    return [(day, bench[day]) for day in wanted if day in bench]
 
 
 def _selected_validation_ref(record: Mapping[str, object]) -> object:
@@ -280,7 +308,7 @@ def fold_equity_payload(root: Path, experiment_id: str, epoch_id: str, fold_id: 
         raise KeyError(f"fold {epoch_id}/{fold_id} has no ledger record")
     validation_ref = _selected_validation_ref(record)
     valid_rows = _returns(experiment_dir, validation_ref)
-    benchmark = _benchmark_returns(experiment_dir, validation_ref)
+    bench_parts = [_benchmark_returns(experiment_dir, validation_ref)]
     series = [_curve_entry("valid", valid_rows)] if valid_rows else []
     exposure_rows: dict[str, list[tuple[str, float]]] = {}
     if valid_rows:
@@ -301,6 +329,8 @@ def fold_equity_payload(root: Path, experiment_id: str, epoch_id: str, fold_id: 
         if test_rows:
             series.append(_curve_entry("test", test_rows))
             exposure_rows["test"] = _exposures(experiment_dir, test_reference)
+            bench_parts.append(_benchmark_returns(experiment_dir, test_reference))
+    benchmark = _chain(bench_parts)
     return {
         "experiment_id": experiment_id,
         "epoch_id": epoch_id,
@@ -325,9 +355,7 @@ def experiment_equity_payload(root: Path, experiment_id: str, *, epoch_id: str |
     selected = [record for record in ordered_folds if str(record.get("epoch_id")) == selected_epoch]
     validation_refs = [_selected_validation_ref(record) for record in selected]
     valid_rows = _chain([_returns(experiment_dir, reference) for reference in validation_refs])
-    benchmark = _chain(
-        [_benchmark_returns(experiment_dir, reference) for reference in validation_refs]
-    )
+    bench_parts = [_benchmark_returns(experiment_dir, reference) for reference in validation_refs]
     rows_by_key: dict[str, list[tuple[str, float]]] = {"valid": valid_rows}
     exposure_by_key: dict[str, list[tuple[str, float]]] = {
         "valid": _chain([_exposures(experiment_dir, reference) for reference in validation_refs])
@@ -341,6 +369,7 @@ def experiment_equity_payload(root: Path, experiment_id: str, *, epoch_id: str |
             reference = _run_result_ref(experiment_dir, record, "test") or (test_refs[result_index] if result_index < len(test_refs) else None)
             test_parts.append(_returns(experiment_dir, reference))
             test_exposure_parts.append(_exposures(experiment_dir, reference))
+            bench_parts.append(_benchmark_returns(experiment_dir, reference))
         rows_by_key["test"] = _chain(test_parts)
         exposure_by_key["test"] = _chain(test_exposure_parts)
         heldout_refs = [record.get("result_ref") for record in latest_heldout_records(records)]
@@ -349,7 +378,10 @@ def experiment_equity_payload(root: Path, experiment_id: str, *, epoch_id: str |
         exposure_by_key["heldout"] = _chain(
             [_exposures(experiment_dir, reference) for reference in heldout_refs]
         )
+        for reference in heldout_refs:
+            bench_parts.append(_benchmark_returns(experiment_dir, reference))
     series = [_curve_entry(key, rows) for key, rows in rows_by_key.items() if rows]
+    benchmark = _chain(bench_parts)
     return {
         "experiment_id": experiment_id,
         "epoch_id": selected_epoch,
