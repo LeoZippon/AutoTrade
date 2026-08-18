@@ -37,6 +37,8 @@ from .proxy import (
     clamp_requested_max_tokens,
     context_overflow_error,
     context_request_fits,
+    is_context_overflow_error,
+    max_tokens_after_provider_overflow,
 )
 
 MODEL_CHOICES = ("deepseek-v4-pro", "deepseek-v4-flash")
@@ -456,10 +458,14 @@ class OpenAICompatibleProxy:
         # it, and the full payload is written once (the first attempt's
         # "started" record); terminal/retry records join via call_id.
         call_id = new_id("call")
+        include_next_payload = True
+        output_clamped = False
         for attempt in range(attempts):
             started_at = utc_now_iso()
             started_perf = time.perf_counter()
             log_path = self._conversation_log_path(started_at)
+            include_payload = include_next_payload
+            include_next_payload = False
             self._write_conversation_log(
                 log_path,
                 _conversation_log_record(
@@ -472,7 +478,7 @@ class OpenAICompatibleProxy:
                     max_attempts=attempts,
                     status="started",
                     call_id=call_id,
-                    include_payload=attempt == 0,
+                    include_payload=include_payload,
                 ),
             )
             try:
@@ -519,6 +525,23 @@ class OpenAICompatibleProxy:
                     http_status_code=error.status_code,
                     error=error,
                 )
+                if (
+                    not output_clamped
+                    and attempt + 1 < attempts
+                    and is_context_overflow_error(error)
+                ):
+                    shrunk = max_tokens_after_provider_overflow(
+                        error, requested_max_tokens=requested_max_tokens
+                    )
+                    if shrunk is not None:
+                        requested_max_tokens = shrunk
+                        body["max_tokens"] = requested_max_tokens
+                        raw = json.dumps(
+                            body, ensure_ascii=False, allow_nan=False
+                        ).encode("utf-8")
+                        output_clamped = True
+                        include_next_payload = True
+                        continue
                 if not can_retry:
                     raise error from None
                 if retry_delay:

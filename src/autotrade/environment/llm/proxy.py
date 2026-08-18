@@ -378,3 +378,36 @@ def is_context_overflow_error(exc: Exception) -> bool:
             "token limit",
         )
     )
+
+
+_PROVIDER_OUTPUT_OVERFLOW = re.compile(
+    r"maximum context length is (?P<window>\d+) tokens\."
+    r".*?requested (?P<output>\d+) output tokens"
+    r".*?prompt contains at least (?P<prompt>\d+) input tokens",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def max_tokens_after_provider_overflow(
+    exc: Exception,
+    *,
+    requested_max_tokens: int,
+    margin: int = CONTEXT_OUTPUT_TOKEN_MARGIN,
+) -> int | None:
+    """If the provider named a prompt that still leaves output room, shrink max_tokens."""
+
+    if (
+        isinstance(requested_max_tokens, bool)
+        or not isinstance(requested_max_tokens, int)
+        or requested_max_tokens <= 0
+    ):
+        raise ValueError("requested_max_tokens must be a positive integer")
+    if isinstance(margin, bool) or not isinstance(margin, int) or margin < 0:
+        raise ValueError("margin cannot be negative")
+    match = _PROVIDER_OUTPUT_OVERFLOW.search(str(exc))
+    if match is None:
+        return None
+    remaining = int(match["window"]) - int(match["prompt"]) - margin
+    if remaining < 1 or remaining >= requested_max_tokens:
+        return None
+    return remaining
