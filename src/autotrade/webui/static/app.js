@@ -155,6 +155,18 @@ function refreshCharts() {
   select.addEventListener("change", () => apply(select.value));
 })();
 
+(function pinTopbarHeight() {
+  const bar = document.querySelector(".topbar");
+  if (!bar || typeof ResizeObserver !== "function") return;
+  const sync = () => {
+    const height = Math.ceil(bar.getBoundingClientRect().height);
+    if (height > 0)
+      document.documentElement.style.setProperty("--topbar-h", `${height}px`);
+  };
+  sync();
+  new ResizeObserver(sync).observe(bar);
+})();
+
 /* Session keys contain "/" (epoch_001/fold_2022Q1); in the hash they travel as
    "~" so URLs stay readable (no %2F). Old encoded links still parse. */
 function sessionKeyToUrl(key) {
@@ -3861,7 +3873,7 @@ function traceReplayNode(experimentId, runId) {
   const info = el("span", { class: "hint", style: "margin:0" }, "");
   const moreButton = el(
     "button",
-    { class: "btn small", style: "display:none" },
+    { type: "button", class: "btn small", style: "display:none" },
     "继续加载",
   );
   let offset = 0,
@@ -3897,7 +3909,11 @@ function traceReplayNode(experimentId, runId) {
       syncMore();
     }
   }
-  moreButton.addEventListener("click", loadBatch);
+  moreButton.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    loadBatch();
+  });
   const download = el(
     "a",
     {
@@ -3906,21 +3922,26 @@ function traceReplayNode(experimentId, runId) {
     },
     "⬇ 下载完整 .jsonl",
   );
-  const details = el(
-    "details",
-    { class: "trace-replay" },
-    el("summary", {}, "Agent Trace（回放）"),
-    el(
-      "div",
-      { class: "trace-replay-body" },
-      el("div", { class: "control-bar" }, moreButton, download, info),
-      box,
-    ),
+  const body = el(
+    "div",
+    { class: "trace-replay-body", hidden: "" },
+    el("div", { class: "control-bar" }, moreButton, download, info),
+    box,
   );
-  details.addEventListener("toggle", () => {
-    if (details.open && !loadedEvents && !loading) loadBatch();
+  const toggle = el(
+    "button",
+    { type: "button", class: "trace-replay-toggle" },
+    "Agent Trace（回放）",
+  );
+  const wrap = el("div", { class: "trace-replay" }, toggle, body);
+  toggle.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const open = wrap.classList.toggle("open");
+    body.hidden = !open;
+    if (open && !loadedEvents && !loading) loadBatch();
   });
-  return details;
+  return wrap;
 }
 
 /* Build the body only when the <details> is first opened: a long trace holds

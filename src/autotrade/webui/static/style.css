@@ -91,10 +91,11 @@ body {
  margin: 0;
  padding: 0;
  max-width: 100%;
+ height: 100%;
+ overflow: hidden;
 }
 body {
- overflow-x: hidden;
- overscroll-behavior-x: none;
+ overscroll-behavior: none;
  background: var(--bg);
  color: var(--text);
  font:
@@ -119,7 +120,11 @@ a:hover {
 
 #app {
  min-width: 0;
+ height: 100%;
  overflow-x: hidden;
+ overflow-y: auto;
+ -webkit-overflow-scrolling: touch;
+ overscroll-behavior: none;
  padding-top: var(--topbar-h);
 }
 .topbar {
@@ -127,7 +132,7 @@ a:hover {
  align-items: center;
  justify-content: space-between;
  gap: 0.75rem;
- flex-wrap: nowrap;
+ flex-wrap: wrap;
  background: var(--panel);
  border-bottom: 1px solid var(--border);
  padding: 0.8rem max(16px, env(safe-area-inset-right, 0px))
@@ -138,9 +143,8 @@ a:hover {
  left: 0;
  right: 0;
  z-index: 40;
- /* Constant height across pages: the homepage's primary button is the tallest
-     occupant; without this the bar shrinks on detail pages and layout jumps. */
- min-height: var(--topbar-h);
+ max-width: 100%;
+ overflow-x: hidden;
  box-sizing: border-box;
 }
 .brand {
@@ -165,7 +169,7 @@ a:hover {
  display: flex;
  align-items: center;
  gap: 1rem;
- flex-wrap: nowrap;
+ flex-wrap: wrap;
  min-width: 0;
 }
 /* 顶部导航：研究 / 模拟 / 实盘交易（active class 由 route() 设置）*/
@@ -1565,6 +1569,7 @@ details.advanced .form-grid {
  margin-top: 0.5rem;
  font-size: 0.86rem;
  max-height: 62vh;
+ max-width: 100%;
  overflow: auto;
  border: 1px solid var(--border);
  border-radius: 8px;
@@ -1715,10 +1720,26 @@ details.advanced .form-grid {
  }
 }
 @media (max-width: 760px) {
+ .topbar-left,
  .topbar-side,
  .topbar-right {
-  flex-wrap: nowrap;
+  flex: 1 1 100%;
+  flex-wrap: wrap;
   min-width: 0;
+  max-width: 100%;
+ }
+ .topbar-side {
+  justify-content: flex-end;
+ }
+ .topbar-right {
+  flex: 1 1 auto;
+ }
+ .topbar-right .btn {
+  flex: 1 1 auto;
+  min-width: 0;
+ }
+ .topnav {
+  flex-wrap: wrap;
  }
  .topbar .mode-note {
   display: none;
