@@ -46,7 +46,18 @@ const ENVIRONMENT_STAGE_LABELS = {
   environment_update: "Sandbox 环境更新",
   analysis: "Fold 策略分析",
   heldout: "执行 Held-out",
+  session_retry: "会话失败重试",
 };
+const PREP_ENVIRONMENT_STAGES = new Set([
+  "preparing_session",
+  "pit_snapshot",
+  "sandbox_layout",
+  "pit_view",
+  "sandbox_start",
+  "heldout",
+  "session_retry",
+  "environment_update",
+]);
 // Dead-worker states the backend can relaunch from a ledger resume; mirrors
 // manager.py _TERMINAL_RESUMABLE_STATES. Keep in sync or the resume button
 // silently disappears for a resumable experiment (e.g. "terminated").
@@ -321,6 +332,56 @@ function toast(message, isError = false) {
 function fmtPct(value, digits = 2) {
   if (value === null || value === undefined || Number.isNaN(value)) return "—";
   return `${(value * 100).toFixed(digits)}%`;
+}
+
+function fmtSharpe(value) {
+  return value === null || value === undefined || Number.isNaN(value)
+    ? "—"
+    : Number(value).toFixed(2);
+}
+
+function sealedMetricTile(revealed, label, value, format = fmtPct) {
+  if (!revealed) return { label, value: "未揭示", cls: "" };
+  return { label, value: format(value), cls: signCls(value) };
+}
+
+function formatStageLine(status, { elapsed = true } = {}) {
+  const stage = status && status.environment_stage;
+  if (!stage) return "";
+  const label = ENVIRONMENT_STAGE_LABELS[stage] || stage;
+  const progress = (status && status.environment_progress) || {};
+  const done = Number(progress.completed ?? progress.day_index);
+  const total = Number(progress.total ?? progress.total_days);
+  const measured =
+    Number.isFinite(done) && Number.isFinite(total) && total > 0
+      ? ` ${done}/${total}`
+      : "";
+  const action = progress.tool
+    ? ` · ${progress.tool}`
+    : progress.call_index
+      ? ` · 第 ${progress.call_index} 次调用`
+      : "";
+  if (!elapsed) return `${label}${measured}${action}`;
+  const started = Date.parse(
+    status.environment_stage_started_at || status.session_started_at || "",
+  );
+  const wait = Number.isFinite(started)
+    ? ` · ${fmtDuration((Date.now() - started) / 1000)}`
+    : "";
+  return `${label}${measured}${action}${wait}`;
+}
+
+function isPrepEnvironment(status, state) {
+  if (state === "running_heldout") return true;
+  const stage = (status && status.environment_stage) || "";
+  if (PREP_ENVIRONMENT_STAGES.has(stage)) return true;
+  return (
+    !stage &&
+    (state === "running_session" ||
+      state === "starting" ||
+      state === "preparing" ||
+      state === "launching")
+  );
 }
 
 function numClass(value) {
@@ -1210,6 +1271,7 @@ function heroSignature(item) {
     item.experiment_id,
     item.state,
     item.worker_alive,
+    item.test_revealed,
     equityFingerprint(item),
     m.mean_test_sharpe,
     m.epoch_id,
@@ -1247,6 +1309,20 @@ function experimentCard(item) {
       item.error ? ` ｜ ${item.error}` : "",
     ),
   );
+  if (item.worker_alive && item.environment_stage) {
+    card.append(
+      el(
+        "div",
+        { class: "meta-line" },
+        formatStageLine({
+          environment_stage: item.environment_stage,
+          environment_stage_started_at: item.environment_stage_started_at,
+          environment_progress: item.environment_progress,
+          session_started_at: item.session_started_at,
+        }),
+      ),
+    );
+  }
   if (Number.isFinite(numericTotal) && numericTotal > 0) {
     const progressValue = Number.isFinite(numericDone)
       ? Math.min(numericTotal, Math.max(0, numericDone))
@@ -1285,16 +1361,16 @@ function experimentCard(item) {
     : "";
   card.append(
     statTilesRow([
-      {
-        label: "Held-out 收益",
-        value: fmtPct(metrics.cum_heldout_return),
-        cls: signCls(metrics.cum_heldout_return),
-      },
-      {
-        label: `累计测试收益${epochTag}`,
-        value: fmtPct(metrics.cum_test_return),
-        cls: signCls(metrics.cum_test_return),
-      },
+      sealedMetricTile(
+        item.test_revealed,
+        "Held-out 收益",
+        metrics.cum_heldout_return,
+      ),
+      sealedMetricTile(
+        item.test_revealed,
+        `累计测试收益${epochTag}`,
+        metrics.cum_test_return,
+      ),
       {
         label: `累计验证收益${epochTag}`,
         value: fmtPct(metrics.cum_valid_return),
@@ -1355,8 +1431,8 @@ function experimentCard(item) {
   return card;
 }
 
-/* Best-performing experiment hero: ranked by mean test-period Sharpe (falls
-   back to cumulative test/validation return when Sharpe is unavailable). */
+/* Best-performing experiment hero: revealed test Sharpe when present,
+   otherwise latest-epoch validation return. */
 function pickBestExperiment(list) {
   const scored = list
     .filter((item) => (item.fold_returns || []).length)
@@ -1413,35 +1489,44 @@ function heroPanel(item) {
         ),
       ),
       stateBadge(item.state),
-      el("span", { class: "mode-note" }, "当前最佳实验（按测试期平均 Sharpe）"),
+      el(
+        "span",
+        { class: "mode-note" },
+        item.test_revealed
+          ? "当前最佳实验（按测试期平均 Sharpe）"
+          : "当前最佳实验（按验证期收益）",
+      ),
     ),
     el(
       "div",
       { class: "section-gap" },
       statTilesRow([
         {
-          label: "Held-out 收益（最终样本外）",
-          value: fmtPct(metrics.cum_heldout_return),
-          cls: `hero-key ${signCls(metrics.cum_heldout_return)}`,
+          ...sealedMetricTile(
+            item.test_revealed,
+            "Held-out 收益（最终样本外）",
+            metrics.cum_heldout_return,
+          ),
+          cls: item.test_revealed
+            ? `hero-key ${signCls(metrics.cum_heldout_return)}`
+            : "",
         },
-        {
-          label: `累计测试收益${metrics.epoch_id ? `（${epochShort(metrics.epoch_id)}）` : ""}`,
-          value: fmtPct(metrics.cum_test_return),
-          cls: signCls(metrics.cum_test_return),
-        },
+        sealedMetricTile(
+          item.test_revealed,
+          `累计测试收益${metrics.epoch_id ? `（${epochShort(metrics.epoch_id)}）` : ""}`,
+          metrics.cum_test_return,
+        ),
         {
           label: `累计验证收益${metrics.epoch_id ? `（${epochShort(metrics.epoch_id)}）` : ""}`,
           value: fmtPct(metrics.cum_valid_return),
           cls: signCls(metrics.cum_valid_return),
         },
-        {
-          label: "平均测试 Sharpe",
-          value:
-            metrics.mean_test_sharpe === null ||
-            metrics.mean_test_sharpe === undefined
-              ? "—"
-              : Number(metrics.mean_test_sharpe).toFixed(2),
-        },
+        sealedMetricTile(
+          item.test_revealed,
+          "平均测试 Sharpe",
+          metrics.mean_test_sharpe,
+          fmtSharpe,
+        ),
         { label: "已完成 Fold", value: String(item.folds_recorded ?? 0) },
       ]),
     ),
@@ -1990,6 +2075,9 @@ async function renderDetailPage(experimentId, selectedKey) {
         ? ` ｜ ${detail.error}`
         : "",
       status.error ? ` ｜ 错误：${status.error}` : "",
+      detail.worker_alive && status.environment_stage
+        ? ` ｜ ${formatStageLine(status, { elapsed: false })}`
+        : "",
       // A worker-recorded analysis error is only current while that worker
       // lives; stale failures are visible per fold in the analysis section.
       detail.worker_alive && status.analysis_error
@@ -2052,29 +2140,27 @@ async function renderDetailPage(experimentId, selectedKey) {
         "div",
         { class: "panel section-gap" },
         statTilesRow([
-          {
-            label: "Held-out 收益（最终样本外）",
-            value: fmtPct(metrics.cum_heldout_return),
-            cls: signCls(metrics.cum_heldout_return),
-          },
-          {
-            label: `累计测试收益${epochTag}`,
-            value: fmtPct(metrics.cum_test_return),
-            cls: signCls(metrics.cum_test_return),
-          },
+          sealedMetricTile(
+            detail.test_revealed,
+            "Held-out 收益（最终样本外）",
+            metrics.cum_heldout_return,
+          ),
+          sealedMetricTile(
+            detail.test_revealed,
+            `累计测试收益${epochTag}`,
+            metrics.cum_test_return,
+          ),
           {
             label: `累计验证收益${epochTag}`,
             value: fmtPct(metrics.cum_valid_return),
             cls: signCls(metrics.cum_valid_return),
           },
-          {
-            label: "平均测试 Sharpe",
-            value:
-              sharpe === null || sharpe === undefined
-                ? "—"
-                : Number(sharpe).toFixed(2),
-            cls: signCls(sharpe),
-          },
+          sealedMetricTile(
+            detail.test_revealed,
+            "平均测试 Sharpe",
+            sharpe,
+            fmtSharpe,
+          ),
           {
             label: "会话进度",
             value: `${detail.completed_sessions ?? 0} / ${detail.total_sessions ?? "?"}`,
@@ -2128,6 +2214,11 @@ async function renderDetailPage(experimentId, selectedKey) {
       )
         route(true);
       else if (String(raw.step_index || "") !== String(status.step_index || ""))
+        route(true);
+      else if (
+        String(raw.environment_stage || "") !==
+        String(status.environment_stage || "")
+      )
         route(true);
     } catch {
       /* transient */
@@ -2479,9 +2570,17 @@ function sessionListPanel(detail, selectedKey) {
           ? "提问待答复"
           : isWaiting
             ? "待批准"
-            : isCurrent
-              ? "运行中"
-              : "";
+            : isCurrent && detail.state === "paused"
+              ? "已暂停"
+              : isCurrent &&
+                  (detail.state === "failed" ||
+                    detail.state === "interrupted" ||
+                    detail.state === "terminated" ||
+                    detail.state === "stopped")
+                ? STATE_LABELS[detail.state] || detail.state
+                : isCurrent
+                  ? formatStageLine(status, { elapsed: false }) || "运行中"
+                  : "";
     const ret =
       session.kind === "fold" || session.kind === "meta_learning"
         ? foldDurationNode(
@@ -2560,13 +2659,23 @@ function sessionDetailPanel(detail, selectedKey) {
   if (detail.kind === "hitl" && (!done || waiting) && !running) {
     panel.append(directivePanel(detail, session, waiting));
   }
-  if (running)
+  const preparing = isPrepEnvironment(status, detail.state);
+  if (
+    (running && preparing) ||
+    runningEnvironment ||
+    (isCurrent &&
+      detail.worker_alive &&
+      preparing &&
+      !waiting &&
+      !done)
+  )
+    panel.append(environmentStagePanel(detail));
+  if (running && !preparing)
     panel.append(
       askUserPanel(detail, session),
       stepGatePanel(detail, session),
       liveTracePanel(detail, session),
     );
-  if (runningEnvironment) panel.append(environmentStagePanel(detail));
   if (session.kind === "fold" && done) {
     const resultPanel = foldResultPanel(detail, session);
     // The ledger can appear while post-Fold analysis is still running, briefly
@@ -2601,7 +2710,8 @@ function sessionDetailPanel(detail, selectedKey) {
   }
   if (session.kind === "meta_learning" && done)
     panel.append(metaResultPanel(detail, session));
-  if (session.kind === "heldout" && done) panel.append(heldoutPanel(session));
+  if (session.kind === "heldout" && done)
+    panel.append(heldoutPanel(detail, session));
   if (done && session.record && session.record.run_id) {
     const statsHost = el("div", {});
     panel.append(
@@ -2639,13 +2749,21 @@ function sessionDetailPanel(detail, selectedKey) {
     })();
   }
   if (!done && !running && !runningEnvironment && !waiting) {
-    panel.append(
-      el(
-        "div",
-        { class: "panel section-gap" },
-        el("div", { class: "empty" }, "该会话尚未开始。"),
-      ),
-    );
+    const idleLabel =
+      isCurrent && detail.worker_alive
+        ? STATE_LABELS[detail.state] || detail.state
+        : isCurrent
+          ? STATE_LABELS[detail.state] || "该会话已中断。"
+          : "该会话尚未开始。";
+    if (!preparing || !isCurrent || !detail.worker_alive) {
+      panel.append(
+        el(
+          "div",
+          { class: "panel section-gap" },
+          el("div", { class: "empty" }, idleLabel),
+        ),
+      );
+    }
   }
   return panel;
 }
@@ -2759,6 +2877,13 @@ function directivePanel(detail, session, waiting) {
         { class: "hint warn" },
         "指令会注入系统提示词并记入账本。已完成 Fold 的 Test 只由系统向 Meta 投影 compact 指标；请勿人工写入 Test/Held-out 明细或具体日历日期，以免绕过受控反馈边界。",
       ),
+      (detail.control || {}).mode === "auto"
+        ? el(
+            "div",
+            { class: "hint" },
+            "自动模式不会等待批准。点「保存指令」才会写入本会话；须在该会话启动前保存。",
+          )
+        : null,
     );
   }
   const buttons = el("div", { class: "control-bar section-gap" });
@@ -2790,6 +2915,27 @@ function directivePanel(detail, session, waiting) {
             }),
         },
         "预览完整系统提示词",
+      ),
+    );
+    buttons.append(
+      el(
+        "button",
+        {
+          class:
+            (detail.control || {}).mode === "auto" && !approved
+              ? "btn primary"
+              : "btn",
+          onclick: () =>
+            send(
+              {
+                action: "set_directive",
+                session_key: session.key,
+                directive: textarea.value,
+              },
+              textarea.value.trim() ? "已保存本会话指令" : "已清除本会话指令",
+            ),
+        },
+        "保存指令",
       ),
     );
     if ((detail.control?.prompt_overrides || {})[session.key]) {
@@ -3599,7 +3745,7 @@ function liveTracePanel(detail, session) {
     el(
       "div",
       { class: "trace-tools" },
-      el("span", { class: "badge state-running_session" }, "streaming"),
+      el("span", { class: "badge state-running_session" }, "实时"),
       el("label", {}, auto, " 自动滚动"),
     ),
     statusLine,
@@ -5313,8 +5459,24 @@ function metaResultPanel(detail, session) {
   return panel;
 }
 
-function heldoutPanel(session) {
+function heldoutPanel(detail, session) {
   const records = session.records || [];
+  const hidden =
+    !detail.test_revealed || records.some((record) => record.hidden);
+  if (hidden) {
+    return el(
+      "div",
+      { class: "panel section-gap" },
+      el("h4", { class: "subsection-title" }, "Held-out 冻结测试（最终样本外）"),
+      el(
+        "div",
+        { class: "empty" },
+        detail.test_revealed
+          ? "Held-out 结果尚未写入。"
+          : "测试与 Held-out 尚未揭示。揭示后才会显示样本外数字。",
+      ),
+    );
+  }
   const results = records.map((record) => record.result || {});
   const returns = results
     .map((result) => result.total_return)

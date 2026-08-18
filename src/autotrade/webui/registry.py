@@ -370,6 +370,14 @@ def summarize_experiment(directory: Path) -> dict[str, object]:
             {
                 "created_at": _created_at(directory, params),
                 "current_session": status.get("session_key") if isinstance(status, Mapping) else None,
+                "session_started_at": status.get("session_started_at") if isinstance(status, Mapping) else None,
+                "environment_stage": status.get("environment_stage") if isinstance(status, Mapping) else None,
+                "environment_stage_started_at": (
+                    status.get("environment_stage_started_at") if isinstance(status, Mapping) else None
+                ),
+                "environment_progress": (
+                    status.get("environment_progress") if isinstance(status, Mapping) else None
+                ),
                 "folds_recorded": len(folds),
                 "meta_recorded": len(meta),
                 "heldout_recorded": len(heldout),

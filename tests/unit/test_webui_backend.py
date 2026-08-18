@@ -1384,6 +1384,30 @@ class WebuiBackendTest(unittest.TestCase):
         self.assertEqual(
             [row["fold_id"] for row in hitl["fold_returns"]], ["fold_2022Q1"]
         )
+        self.assertIsNone(hitl["environment_stage"])
+        self.assertIsNone(hitl["metrics"]["cum_heldout_return"])
+        self.assertIsNone(hitl["metrics"]["cum_test_return"])
+
+    def test_list_exposes_the_live_environment_stage(self) -> None:
+        status_path = self.experiments_root / "exp_hitl" / "hitl" / "status.json"
+        status = json.loads(status_path.read_text(encoding="utf-8"))
+        status["environment_stage"] = "pit_snapshot"
+        status["environment_stage_started_at"] = "2026-08-17T23:46:10+00:00"
+        status["session_started_at"] = "2026-08-17T23:46:10+00:00"
+        status["environment_progress"] = {"day_index": 3, "total_days": 10}
+        write_json_atomic(status_path, status)
+        hitl = {
+            entry["experiment_id"]: entry
+            for entry in self.client.get("/api/experiments").json()["experiments"]
+        }["exp_hitl"]
+        self.assertEqual(hitl["environment_stage"], "pit_snapshot")
+        self.assertEqual(
+            hitl["environment_stage_started_at"], "2026-08-17T23:46:10+00:00"
+        )
+        self.assertEqual(hitl["session_started_at"], "2026-08-17T23:46:10+00:00")
+        self.assertEqual(
+            hitl["environment_progress"], {"day_index": 3, "total_days": 10}
+        )
 
     # ---- reveal / seal --------------------------------------------------------
     def test_heldout_completion_auto_reveals_and_seals(self) -> None:
