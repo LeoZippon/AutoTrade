@@ -1551,6 +1551,42 @@ class SnapshotBuilderTest(unittest.TestCase):
             self.assertNotIn("limit_amount", zero_meta["dataset_columns"]["limit_list_d"])
             self.assertIn("fd_amount", zero_meta["dataset_columns"]["limit_list_d"])
 
+    def test_available_at_union_keeps_dataset_order_when_datasets_load_in_parallel(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            raw = Path(tmp) / "raw"
+            build_raw(raw)
+            write(
+                raw / "top_list" / "trade_date=20211007.parquet",
+                pd.DataFrame([
+                    {
+                        "trade_date": "20211007",
+                        "ts_code": "000001.SZ",
+                        "name": "a",
+                        "available_at": "2021-10-07 16:00:00+08:00",
+                    }
+                ]),
+            )
+            write(
+                raw / "block_trade" / "trade_date=20211007.parquet",
+                pd.DataFrame([
+                    {
+                        "trade_date": "20211007",
+                        "ts_code": "000002.SZ",
+                        "price": 10.0,
+                        "available_at": "2021-10-07 16:00:00+08:00",
+                    }
+                ]),
+            )
+            builder = SnapshotBuilder(raw, Path(tmp) / "fund_events_missing")
+            window_start = pd.Timestamp("2021-09-01", tz="Asia/Shanghai")
+            union, meta = builder._build_available_at_domain(
+                ("block_trade", "top_list"), DECISION, window_start
+            )
+            self.assertEqual(list(union["dataset"]), ["block_trade", "top_list"])
+            self.assertEqual(meta["datasets"], ["block_trade", "top_list"])
+            self.assertIn("price", union.columns)
+            self.assertIn("name", union.columns)
+
     def test_news_text_guards_sources_window_and_dedup(self):
         with tempfile.TemporaryDirectory() as tmp:
             raw = Path(tmp) / "raw"

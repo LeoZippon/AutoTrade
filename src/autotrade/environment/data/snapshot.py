@@ -75,6 +75,9 @@ from autotrade.environment.data.units import (
 from autotrade.environment.runtime import new_id, utc_now_iso
 
 SNAPSHOT_DOMAIN_WORKERS = 3
+# Independent event/macro datasets are mostly parquet IO; overlap them so a
+# 30-dataset union is not 30 serial scans.
+_DATASET_UNION_WORKERS = 8
 # Per-dataset partition fan-in: daily-partitioned event datasets hold thousands
 # of small files whose parquet decode releases the GIL.
 _PARTITION_READ_WORKERS = 8
@@ -1410,16 +1413,7 @@ class SnapshotBuilder:
         forward_events: bool = False,
         screen: frozenset[str] | None = None,
     ) -> tuple[pd.DataFrame, dict[str, object]]:
-        frames: list[pd.DataFrame] = []
-        schema_only: dict[str, pd.DataFrame] = {}
-        rules: dict[str, str] = {}
-        # Per-dataset column attribution for the unit reference: the union file
-        # schema alone cannot say which dataset a column belongs to.
-        dataset_columns: dict[str, list[str]] = {}
-        dataset_build_profile: dict[str, dict[str, object]] = {}
-        duplicate_rows_dropped: dict[str, int] = {}
-        nat_counts: dict[str, int] = {}
-        for dataset in datasets:
+        def load_one(dataset: str) -> dict[str, object]:
             dataset_started = time.perf_counter()
             dataset_dir = self.raw_dir / dataset
             if not dataset_dir.exists():
@@ -1435,13 +1429,13 @@ class SnapshotBuilder:
             exempt = lifetime_registries and dataset in MACRO_REGISTRY_DATASETS
             floor = _REGISTRY_WINDOW_FLOOR if exempt else window_start
             forward_column = FORWARD_EVENT_DATE_COLUMNS.get(dataset) if forward_events else None
+            local_nat: dict[str, int] = {}
             rows, read_profile = self._read_dataset_window(
-                dataset_dir, decision_time, floor, nat_counts, forward_event_column=forward_column
+                dataset_dir, decision_time, floor, local_nat, forward_event_column=forward_column
             )
             excluded = SNAPSHOT_EXCLUDED_COLUMNS.get(dataset, ())
             if excluded:
                 rows = rows.drop(columns=[column for column in excluded if column in rows.columns])
-            rules[dataset] = "raw available_at column"
             had_visible_rows = not rows.empty
             # Overlapping partition files (the pre-canonical macro range
             # family) repeat identical rows; a duplicated series distorts
@@ -1451,7 +1445,6 @@ class SnapshotBuilder:
             deduplicate_seconds = time.perf_counter() - started
             duplicate_count = int(len(rows) - len(deduped))
             if duplicate_count:
-                duplicate_rows_dropped[dataset] = duplicate_count
                 rows = deduped
             # Screen while the frame is still narrow (its own columns only). A
             # post-union screen materializes a rows × union-columns take that
@@ -1461,53 +1454,73 @@ class SnapshotBuilder:
             started = time.perf_counter()
             rows = self._apply_screen(rows, screen)
             screen_seconds = time.perf_counter() - started
-            # Every configured dataset contributes its schema even without
-            # visible rows in this window (screen-emptied, or coverage starting
-            # after the decision time): the Timeview intersects replay parts to
-            # the frozen snapshot schema, so a missing column here would drop
-            # that dataset's replay data for the whole fold. Zero-row schema
-            # contributions are applied after the union (not concatenated) so
-            # dtype inference never sees empty entries.
+            schema = None
+            frame = None
+            columns: list[str]
             if had_visible_rows and len(rows):
                 rows.insert(0, "dataset", dataset)
-                frames.append(rows)
-                dataset_columns[dataset] = list(rows.columns)
+                frame = rows
+                columns = list(rows.columns)
             else:
                 schema = _dataset_footer_schema(dataset_dir)
-                if schema is not None:
-                    if excluded:
-                        # Keep the zero-row schema contribution consistent with
-                        # the rows path, or frozen and replay parts would
-                        # disagree on the excluded columns.
-                        schema = pa.schema([field for field in schema if field.name not in excluded])
-                    schema_only[dataset] = schema
-                    dataset_columns[dataset] = ["dataset", *schema.names]
-            dataset_build_profile[dataset] = {
-                **read_profile,
-                "rows_output": int(len(rows)),
-                "duplicate_rows_dropped": duplicate_count,
-                "screen_rows_dropped": int(rows_before_screen - len(rows)),
-                "total_seconds": round(time.perf_counter() - dataset_started, 3),
-                "phases": {
-                    **read_profile["phases"],
-                    "deduplicate_seconds": round(deduplicate_seconds, 3),
-                    "screen_seconds": round(screen_seconds, 3),
+                if schema is not None and excluded:
+                    # Keep the zero-row schema contribution consistent with
+                    # the rows path, or frozen and replay parts would
+                    # disagree on the excluded columns.
+                    schema = pa.schema([field for field in schema if field.name not in excluded])
+                columns = ["dataset", *schema.names] if schema is not None else ["dataset"]
+            return {
+                "dataset": dataset,
+                "frame": frame,
+                "schema": schema,
+                "columns": columns,
+                "nat": local_nat.get(dataset, 0),
+                "duplicate_count": duplicate_count,
+                "profile": {
+                    **read_profile,
+                    "rows_output": int(len(rows)),
+                    "duplicate_rows_dropped": duplicate_count,
+                    "screen_rows_dropped": int(rows_before_screen - len(rows)),
+                    "total_seconds": round(time.perf_counter() - dataset_started, 3),
+                    "phases": {
+                        **read_profile["phases"],
+                        "deduplicate_seconds": round(deduplicate_seconds, 3),
+                        "screen_seconds": round(screen_seconds, 3),
+                    },
                 },
             }
+
+        if len(datasets) > 1:
+            with ThreadPoolExecutor(
+                max_workers=min(_DATASET_UNION_WORKERS, len(datasets)),
+                thread_name_prefix="snapshot-dataset",
+            ) as pool:
+                loaded = list(pool.map(load_one, datasets))
+        else:
+            loaded = [load_one(dataset) for dataset in datasets]
+
+        frames: list[pd.DataFrame] = []
+        schema_only: dict[str, object] = {}
+        rules: dict[str, str] = {}
+        dataset_columns: dict[str, list[str]] = {}
+        dataset_build_profile: dict[str, dict[str, object]] = {}
+        duplicate_rows_dropped: dict[str, int] = {}
+        nat_counts: dict[str, int] = {}
+        for item in loaded:
+            dataset = str(item["dataset"])
+            rules[dataset] = "raw available_at column"
+            dataset_columns[dataset] = list(item["columns"])
+            dataset_build_profile[dataset] = item["profile"]  # type: ignore[assignment]
+            if int(item["duplicate_count"]):
+                duplicate_rows_dropped[dataset] = int(item["duplicate_count"])
+            if int(item["nat"]):
+                nat_counts[dataset] = int(item["nat"])
+            if item["frame"] is not None:
+                frames.append(item["frame"])  # type: ignore[arg-type]
+            elif item["schema"] is not None:
+                schema_only[dataset] = item["schema"]
         merged = concat_rows(frames) if frames else pd.DataFrame()
-        if schema_only and "dataset" not in merged.columns:
-            merged.insert(0, "dataset", pd.Series([None] * len(merged), dtype=pd.ArrowDtype(pa.string()), index=merged.index))
-        for schema in schema_only.values():
-            for field in schema:
-                if field.name not in merged.columns:
-                    # Exact arrow-typed all-NA padding from the dataset's own
-                    # footer: frozen and replay parts then carry the SAME
-                    # column type, which pyarrow's multi-part reader requires
-                    # (an object-None column writes as the null type, and
-                    # casting a concrete replay type to null is unsupported).
-                    merged[field.name] = pd.Series(
-                        [None] * len(merged), dtype=pd.ArrowDtype(field.type), index=merged.index
-                    )
+        merged = _pad_union_schema(merged, schema_only)
         # units="source": heterogeneous unions keep TuShare per-source units —
         # the daily-domain unit contract does NOT extend to same-named fields
         # here (env docs §1.4; raw unit table in data docs §1.2).
@@ -1962,6 +1975,37 @@ def _run_domain_tasks(tasks: list[DomainBuildTask]) -> dict[str, DomainBuildResu
     finally:
         executor.shutdown(wait=True, cancel_futures=True)
     return results
+
+
+def _pad_union_schema(merged: pd.DataFrame, schema_only: Mapping[str, object]) -> pd.DataFrame:
+    """Add zero-row dataset columns in one Arrow pass.
+
+    Assigning each missing column through pandas on an 8M-row union recopies
+    the frame per column. Arrow appends null arrays without rewriting row data.
+    """
+    missing: list[pa.Field] = []
+    seen: set[str] = set(merged.columns)
+    if schema_only and "dataset" not in seen:
+        missing.append(pa.field("dataset", pa.string()))
+        seen.add("dataset")
+    for schema in schema_only.values():
+        if not isinstance(schema, pa.Schema):
+            continue
+        for field in schema:
+            if field.name not in seen:
+                missing.append(field)
+                seen.add(field.name)
+    if not missing:
+        return merged
+    if merged.empty:
+        for field in missing:
+            merged[field.name] = pd.Series(dtype=pd.ArrowDtype(field.type))
+        return merged
+    table = pa.Table.from_pandas(merged, preserve_index=False)
+    n = table.num_rows
+    for field in missing:
+        table = table.append_column(field.name, pa.nulls(n, type=field.type))
+    return table.to_pandas(types_mapper=pd.ArrowDtype)
 
 
 def _window_start(decision_time: datetime, months: int) -> pd.Timestamp:
