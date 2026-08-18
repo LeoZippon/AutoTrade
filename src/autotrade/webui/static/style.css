@@ -1182,15 +1182,20 @@ details.test-audit summary {
  align-items: flex-start;
  justify-content: center;
  padding: 4vh 14px;
+ overflow: hidden;
+ overscroll-behavior: none;
 }
 .modal {
  background: var(--panel);
  border-radius: 15px;
  box-shadow: 0 12px 44px rgba(0, 0, 0, 0.35);
  width: min(960px, 100%);
+ max-width: 100%;
+ min-width: 0;
  max-height: 92vh;
  display: flex;
  flex-direction: column;
+ overflow-x: hidden;
 }
 .modal header {
  display: flex;
@@ -1205,14 +1210,20 @@ details.test-audit summary {
 }
 .modal .body {
  padding: 0.6rem 1.5rem 1.25rem;
- overflow: auto;
+ overflow-x: hidden;
+ overflow-y: auto;
+ overscroll-behavior: contain;
+ -webkit-overflow-scrolling: touch;
+ min-width: 0;
 }
 .modal footer {
  padding: 0.85rem 1.5rem;
  border-top: 1px solid var(--border);
  display: flex;
  justify-content: flex-end;
+ flex-wrap: wrap;
  gap: 0.7rem;
+ min-width: 0;
 }
 .form-group {
  margin: 1.05rem 0 4px;
@@ -1224,8 +1235,18 @@ details.test-audit summary {
 }
 .form-grid {
  display: grid;
- grid-template-columns: 1fr 1fr;
+ grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
  gap: 0.7rem 1.4rem;
+ min-width: 0;
+}
+.field {
+ min-width: 0;
+ max-width: 100%;
+}
+.field .help,
+.modal .hint {
+ overflow-wrap: anywhere;
+ word-break: break-word;
 }
 .field-wide {
  grid-column: 1 / -1;
@@ -1748,7 +1769,7 @@ details.advanced .form-grid {
   grid-template-columns: 1fr;
  }
  .form-grid {
-  grid-template-columns: 1fr;
+  grid-template-columns: minmax(0, 1fr);
  }
  .form-grid > .field.checkbox {
   padding-top: 0;
