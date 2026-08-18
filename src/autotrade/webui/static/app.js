@@ -1031,9 +1031,14 @@ function equityChart(
     "div",
     { class: "svg-chart" },
     chartLegend(
-      seriesList.map((s) => ({
+      (mini
+        ? seriesList.filter((s) => !String(s.key).startsWith("benchmark"))
+        : seriesList
+      ).map((s) => ({
         color: s.color,
-        label: `${s.label}: ${fmtPct(s.final)}`,
+        label: mini
+          ? `${CYCLE_SERIES_SHORT[s.key] || s.label} ${fmtPct(s.final)}`
+          : `${s.label}: ${fmtPct(s.final)}`,
       })),
     ),
   );

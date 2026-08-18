@@ -931,15 +931,27 @@ textarea.directive {
 }
 .chart-legend {
  display: flex;
- gap: 1.1rem;
+ flex-wrap: wrap;
+ gap: 0.45rem 1.1rem;
  margin: 2px 0 0.45rem;
  font-size: 0.875rem;
  color: var(--muted);
+ min-width: 0;
+ max-width: 100%;
 }
 .legend-item {
  display: inline-flex;
  align-items: center;
  gap: 0.45rem;
+ min-width: 0;
+}
+.card .svg-chart {
+ min-width: 0;
+ overflow: hidden;
+}
+.card .chart-legend {
+ font-size: 0.75rem;
+ gap: 0.25rem 0.65rem;
 }
 .legend-swatch {
  width: 0.75rem;
