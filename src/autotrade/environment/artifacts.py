@@ -169,6 +169,7 @@ class FilesystemArtifactStore:
             artifact_id=artifact_id, path=directory / "output", model_path=directory / "models",
             source_run_id=run_id, source_fold_id=fold_id, source_step_id=step_id,
             revision_id=revision_id,
+            requires_validation=False,
         )
 
     def prune_transient(self, *, keep_frozen_ids: tuple[str, ...] = ()) -> None:
@@ -226,6 +227,7 @@ class FilesystemArtifactStore:
             source_fold_id=str(manifest["fold_id"]),
             source_step_id=str(manifest["source_step_id"]),
             revision_id=str(manifest["revision_id"]),
+            requires_validation=False,
         )
 
     @staticmethod

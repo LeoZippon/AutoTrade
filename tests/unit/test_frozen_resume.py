@@ -77,6 +77,14 @@ def _append_meta(
     )
 
 
+def test_freeze_revision_is_a_valid_fold_parent_without_validation_flag(tmp_path: Path) -> None:
+    store = FilesystemArtifactStore(tmp_path / "store")
+    frozen = _freeze(store, "strategy_fold_001")
+    assert frozen.requires_validation is False
+    reloaded = store.frozen(frozen.artifact_id, expected_path=frozen.path, experiment_id="exp")
+    assert reloaded.requires_validation is False
+
+
 def test_prune_keeps_prior_fold_and_meta_and_drops_superseded(tmp_path: Path) -> None:
     store = FilesystemArtifactStore(tmp_path / "store")
     ledger = ExperimentLedger(tmp_path / "ledger.jsonl")
