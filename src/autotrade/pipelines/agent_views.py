@@ -42,6 +42,10 @@ def metrics(summary: dict[str, object] | None) -> dict[str, object] | None:
     return compact
 
 
+def _visible_metrics(value: object) -> dict[str, object] | None:
+    return agent_visible_metrics(value if isinstance(value, dict) else None)
+
+
 def agent_visible_metrics(summary: dict[str, object] | None) -> dict[str, object] | None:
     """Compact metric projection safe for Meta workspace history."""
 
@@ -135,15 +139,13 @@ def compact_fold_history(
         "fold_id": _agent_visible_ref(record.get("fold_id"), prefix="fold_ref"),
         "fold_status": record.get("fold_status"),
         "finish_reason": record.get("finish_reason"),
-        "validation_result": record.get("validation_result"),
+        "validation_result": _visible_metrics(record.get("validation_result")),
         "accept_reasons": record.get("accept_reasons"),
         "accept_warnings": record.get("accept_warnings"),
         "backtest_summaries": backtests,
     }
     if include_frozen_test_metrics and record.get("record_type") == "fold":
-        compact["test_result"] = agent_visible_metrics(
-            record.get("test_result") if isinstance(record.get("test_result"), dict) else None
-        )
+        compact["test_result"] = _visible_metrics(record.get("test_result"))
     return compact
 
 
@@ -182,10 +184,10 @@ def agent_visible_ledger_record(
         "valid_decision_time",
     }
     public = {key: value for key, value in public.items() if key in allowed}
+    if "validation_result" in public:
+        public["validation_result"] = _visible_metrics(public.get("validation_result"))
     if include_frozen_test_metrics and record.get("record_type") == "fold":
-        public["test_result"] = agent_visible_metrics(
-            record.get("test_result") if isinstance(record.get("test_result"), dict) else None
-        )
+        public["test_result"] = _visible_metrics(record.get("test_result"))
     if "fold_id" in record:
         public["fold_id"] = _agent_visible_ref(record.get("fold_id"), prefix="fold_ref")
     for key in ("parent_strategy_artifact_id", "frozen_strategy_artifact_id"):

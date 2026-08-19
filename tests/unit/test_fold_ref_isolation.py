@@ -226,6 +226,50 @@ def test_step_tree_node_ids_the_agent_reads_back_are_opaque(fold_session):
         assert FOLD_REF in step_id
 
 
+def test_compact_fold_history_keeps_metrics_and_drops_per_stock_series():
+    compact = compact_fold_history(
+        {
+            "epoch_id": "epoch_001",
+            "fold_id": "fold_2024Q2",
+            "fold_status": "frozen",
+            "finish_reason": "finish_fold",
+            "validation_result": {
+                "total_return": 0.01,
+                "sharpe": 0.4,
+                "per_stock": {"000001.SZ": [0.1] * 80},
+                "weekly_returns": [0.01] * 40,
+            },
+        }
+    )
+    metrics = compact["validation_result"]
+    assert isinstance(metrics, dict)
+    assert metrics["total_return"] == 0.01
+    assert "per_stock" not in metrics
+    assert "weekly_returns" not in metrics
+    rendered = json.dumps(compact, ensure_ascii=False)
+    assert "000001.SZ" not in rendered
+
+
+def test_meta_learning_prompt_does_not_inline_development_history():
+    from autotrade.agent.prompts import build_meta_learning_prompt
+
+    prompt = build_meta_learning_prompt(
+        {
+            "fold_backtest_summaries": [
+                {
+                    "fold_id": "fold_ref_deadbeef",
+                    "validation_result": {"per_stock": {"000001.SZ": [0.1] * 80}},
+                }
+            ]
+        },
+        previous_taste="keep the daily floor",
+    )
+    assert "inputs/meta_context.json" in prompt
+    assert "keep the daily floor" in prompt
+    assert "per_stock" not in prompt
+    assert "fold_backtest_summaries" not in prompt
+
+
 def test_meta_visible_projections_opaque_the_fold_id(fold_session):
     fold = fold_session["fold"]
     compact = compact_fold_history(fold, include_frozen_test_metrics=True)

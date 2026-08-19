@@ -1352,7 +1352,10 @@ class LLMMetaLearner:
         runner = AgentSessionRunner(
             llm=budgeted,
             tools=ToolRegistry(tools),
-            system_prompt=build_system_prompt(mode="meta", experiment_facts=public),
+            system_prompt=build_system_prompt(
+                mode="meta",
+                experiment_facts=build_experiment_facts(manifest=manifest.data),
+            ),
             config=AgentSessionConfig(
                 mode="meta",
                 max_llm_calls=self.max_llm_calls,

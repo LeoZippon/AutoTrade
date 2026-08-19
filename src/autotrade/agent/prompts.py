@@ -341,17 +341,14 @@ def build_meta_learning_prompt(
     fold_exploration_directive: str = "",
     experiment_facts: Mapping[str, object] | None = None,
 ) -> str:
+    del history  # on disk as inputs/meta_context.json; inlining it overflows the window
     sections = [
-        "请从下列本地 development 证据提炼后续 Fold 的 Taste。不要输出逐 Fold 测试明细，不要使用任何外部资料。\n"
-        + json.dumps(
-            {
-                "previous_taste": previous_taste,
-                "development": dict(history or {}),
-            },
-            ensure_ascii=False,
-            default=str,
-        )
+        "请从本地 development 证据提炼后续 Fold 的 Taste。"
+        "先读 `inputs/meta_context.json`，需要时再读 `inputs/meta_learning_memory.jsonl`。"
+        "不要输出逐 Fold 测试明细，不要使用任何外部资料。"
     ]
+    if previous_taste.strip():
+        sections.append("# 上一份 Taste\n" + previous_taste.strip())
     if experiment_facts:
         sections.insert(0, render_experiment_facts_section(experiment_facts))
     exploration = build_meta_fold_exploration_section(fold_exploration_directive)
