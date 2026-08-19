@@ -612,6 +612,8 @@ class LLMFoldDeveloper:
         explore_max_tokens: int = 6_000,
         step_tree_enabled: bool = True,
         fold_exploration_directive: str = "",
+        workspace_reference: str = "",
+        repo_root: str | Path | None = None,
     ) -> None:
         self.llm = llm
         self.explore_llm = explore_llm or llm
@@ -631,6 +633,8 @@ class LLMFoldDeveloper:
         self.explore_max_tokens = explore_max_tokens
         self.step_tree_enabled = step_tree_enabled
         self.fold_exploration_directive = fold_exploration_directive
+        self.workspace_reference = workspace_reference
+        self.repo_root = Path(repo_root).resolve() if repo_root is not None else None
         validate_strategy_source(
             self.baseline_strategy.read_text(encoding="utf-8"),
             filename=self.baseline_strategy.name,
@@ -762,6 +766,11 @@ class LLMFoldDeveloper:
         copy_model_artifacts(source_models, models_dir)
         restore_working_artifacts_writable(output_dir, models_dir)
         inputs_dir.mkdir()
+        install_workspace_reference(
+            workspace_root,
+            self.workspace_reference,
+            repo_root=self.repo_root,
+        )
         # Fold sessions never see frozen Test metrics: only the meta session is
         # allowed that adaptive feedback (docs/pipeline-design.md §3.2).
         history = [
@@ -1125,6 +1134,8 @@ class LLMMetaLearner:
         max_response_tokens: int = 8_000,
         meta_learning_directive: str = "",
         fold_exploration_directive: str = "",
+        workspace_reference: str = "",
+        repo_root: str | Path | None = None,
         regularization_constraints: ModificationConstraints | None = None,
         sandbox_spec: SandboxSpec | None = None,
         use_docker: bool = True,
@@ -1154,6 +1165,8 @@ class LLMMetaLearner:
         self.max_response_tokens = max_response_tokens
         self.meta_learning_directive = meta_learning_directive
         self.fold_exploration_directive = fold_exploration_directive
+        self.workspace_reference = workspace_reference
+        self.repo_root = Path(repo_root).resolve() if repo_root is not None else None
         # The limits a Meta regularization must satisfy before the Pipeline will
         # freeze it; published in the run manifest and enforced by the check.
         self.regularization_constraints = (
@@ -1200,6 +1213,11 @@ class LLMMetaLearner:
         # Only a Meta session may declare new sandbox dependencies, so only a
         # Meta workspace carries the request format example.
         write_sandbox_environment_example(paths.workspace)
+        install_workspace_reference(
+            paths.workspace,
+            self.workspace_reference,
+            repo_root=self.repo_root,
+        )
         safe = SafeWorkspace(paths.workspace)
         search_roots = SearchRoots(safe, paths=paths)
         inputs = paths.workspace / "inputs"
@@ -1443,6 +1461,87 @@ class LLMMetaLearner:
                 {"status": "error", "error": f"{type(exc).__name__}: {exc}"},
             )
             raise
+
+
+_WORKSPACE_REFS_DIR = "refs"
+_REFERENCE_SKIP_NAMES = frozenset({".git", "__pycache__", "node_modules", ".venv"})
+_REFERENCE_PDF_MAX_BYTES = 256 * 1024
+
+
+def install_workspace_reference(
+    workspace: str | Path,
+    workspace_reference: str | Path | None,
+    *,
+    repo_root: str | Path | None = None,
+) -> None:
+    """Copy optional operator notes into ``workspace/refs/`` before sandbox start.
+
+    An empty ``workspace_reference`` is a no-op. A set path must exist and be a
+    directory, otherwise this fails immediately. The copy writes only ``refs/``,
+    never ``output/``, ``models/``, or ``inputs/``. Each Fold/Meta session has a
+    fresh workspace, so later sessions see the notes only because this hook runs
+    again.
+    """
+    raw = str(workspace_reference or "").strip()
+    if not raw:
+        return
+    seed = Path(raw)
+    if not seed.is_absolute():
+        if repo_root is None:
+            raise FileNotFoundError(f"workspace_reference does not exist: {raw}")
+        seed = Path(repo_root) / seed
+    if not seed.exists():
+        raise FileNotFoundError(f"workspace_reference does not exist: {raw}")
+    try:
+        seed = seed.resolve(strict=True)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"workspace_reference does not exist: {raw}") from exc
+    if not seed.is_dir():
+        raise NotADirectoryError(f"workspace_reference must be a directory: {seed}")
+    if repo_root is not None:
+        root = Path(repo_root).resolve()
+        if seed != root and root not in seed.parents:
+            raise ValueError("workspace_reference must stay inside the repository")
+    dest = Path(workspace) / _WORKSPACE_REFS_DIR
+    if dest.exists():
+        raise FileExistsError(f"workspace refs directory already exists: {dest}")
+    dest.mkdir()
+    _copy_workspace_reference_tree(seed, dest, seed_root=seed)
+    chmod_tree(dest, file_mode=0o444, dir_mode=0o555)
+
+
+def _skip_workspace_reference_name(name: str) -> bool:
+    return name.startswith(".") or name in _REFERENCE_SKIP_NAMES
+
+
+def _copy_workspace_reference_tree(
+    source: Path, dest: Path, *, seed_root: Path
+) -> None:
+    dest.mkdir(parents=True, exist_ok=True)
+    for child in source.iterdir():
+        if _skip_workspace_reference_name(child.name):
+            continue
+        if child.is_symlink():
+            continue
+        if child.is_dir():
+            _copy_workspace_reference_tree(
+                child, dest / child.name, seed_root=seed_root
+            )
+            continue
+        if not child.is_file():
+            continue
+        if (
+            child.suffix.lower() == ".pdf"
+            and child.stat().st_size > _REFERENCE_PDF_MAX_BYTES
+        ):
+            continue
+        try:
+            resolved = child.resolve(strict=True)
+        except OSError:
+            continue
+        if resolved != seed_root and seed_root not in resolved.parents:
+            continue
+        shutil.copy2(child, dest / child.name, follow_symlinks=False)
 
 
 def _environment_phase(

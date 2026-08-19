@@ -6,10 +6,11 @@ this schema can never drift from the worker. Descriptions follow
 docs/parameters-reference.md.
 
 Deliberately NOT exposed in the form: ``experiments_root``/``work_root`` are
-force-overwritten with manager-owned values on creation (ExperimentManager), and
-``WEB_INTERNAL_PARAMS`` describe the only supported research environment — the
-console API rejects them outright, so they can only be set in a worker-side
-``params.json``.
+force-overwritten with manager-owned values on creation (ExperimentManager);
+``workspace_reference`` is persisted and accepted by create/worker but has no
+form field, so it is set in ``params.json``; and ``WEB_INTERNAL_PARAMS``
+describe the only supported research environment — the console API rejects them
+outright, so they can only be set in a worker-side ``params.json``.
 
 Period labels are error-prone to type, so the four period fields render as
 dropdowns whenever the server can enumerate valid labels from the SSE trading

@@ -48,6 +48,7 @@ WEB_CREATE_DEFAULTS: dict[str, object] = {
     "meta_learning_fold_interval": 1,
     "meta_memory_max_epochs": 3,
     "fold_exploration_directive": "",
+    "workspace_reference": "",
     "inherit_from": "",
     "strategy_period": "day",
     "inference_time": "08:30",

@@ -163,6 +163,10 @@ class RollingExperimentConfig:
     # automatically assembled ordinary Fold prompt. Per-Fold HITL directives
     # remain a separate, additive control surface.
     fold_exploration_directive: str = ""
+    # Optional repo-relative directory of Agent-readable notes copied into each
+    # Fold/Meta session's workspace/refs/. Empty keeps the historical no-copy
+    # behavior; a set path must exist and be a directory.
+    workspace_reference: str = ""
     # If meta-learning writes workspace/sandbox_environment.json, Pipeline can
     # build a derived Docker image and use it for later ordinary Fold runs.
     meta_sandbox_rebuild_enabled: bool = True

@@ -242,7 +242,7 @@ def _reclaim_sandbox_containers(experiment_id: str) -> list[str]:
     an empty listing simply reclaims nothing."""
     try:
         listing = subprocess.run(
-            ["docker", "ps", "-aq", "--filter", f"label=mq.experiment={experiment_id}"],
+            ["docker", "ps", "-aq", "--filter", f"label=adm.experiment={experiment_id}"],
             capture_output=True,
             text=True,
             timeout=30,

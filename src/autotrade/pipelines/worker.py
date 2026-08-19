@@ -129,6 +129,7 @@ _ALLOWED_PARAMS = {
     "inherit_from",
     "meta_learning_directive",
     "fold_exploration_directive",
+    "workspace_reference",
     "disable_step_tree",
     "record_failed_attempts",
     "convergence_start_epoch",
@@ -525,6 +526,9 @@ def resolve_worker_options(
         fold_exploration_directive=_calendar_free_text(
             params.get("fold_exploration_directive"), "fold_exploration_directive"
         ),
+        workspace_reference=_optional_workspace_reference(
+            params.get("workspace_reference"), repository
+        ),
         step_tree_enabled=not _strict_bool(
             params.get("disable_step_tree", False), "disable_step_tree"
         ),
@@ -753,6 +757,8 @@ def run_local_interactive_worker(
             ),
             step_tree_enabled=options.rolling.step_tree_enabled,
             fold_exploration_directive=options.rolling.fold_exploration_directive,
+            workspace_reference=options.rolling.workspace_reference,
+            repo_root=options.repo_root,
         )
         meta_learner = LLMMetaLearner(
             llm=meta_gateway,
@@ -767,6 +773,8 @@ def run_local_interactive_worker(
             max_response_tokens=options.llm.max_tokens_for("meta"),
             meta_learning_directive=options.rolling.meta_learning_directive,
             fold_exploration_directive=options.rolling.fold_exploration_directive,
+            workspace_reference=options.rolling.workspace_reference,
+            repo_root=options.repo_root,
             regularization_constraints=options.rolling.regularization_constraints,
             sandbox_spec=options.agent_sandbox,
             # A sandboxless smoke run must not shell out to docker build.
@@ -1457,6 +1465,19 @@ def _validate_local_context(settings: LLMWorkerSettings) -> None:
                 "compact_token_threshold must be <= "
                 f"{maximum} for the {role} local model context"
             )
+
+
+def _optional_workspace_reference(value: object, repo_root: Path) -> str:
+    if value in (None, ""):
+        return ""
+    if not isinstance(value, str):
+        raise ValueError("workspace_reference must be a string")
+    text = value.strip()
+    if not text:
+        return ""
+    # Config seed, not a data lake: existence is required even at create preflight.
+    _repo_dir(repo_root, text, "workspace_reference")
+    return text
 
 
 def _required_text(params: dict[str, object], key: str) -> str:
