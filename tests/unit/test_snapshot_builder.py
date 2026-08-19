@@ -1963,6 +1963,103 @@ class SnapshotBuilderTest(unittest.TestCase):
                     DECISION, Path(tmp) / "snap", config
                 )
 
+    def test_disabled_events_do_not_write_an_empty_events_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            raw = Path(tmp) / "raw"
+            events_root = Path(tmp) / "fund_events"
+            status_path = Path(tmp) / "fundamental_events_status.json"
+            build_raw(raw)
+            build_fundamental_events(events_root)
+            write_fundamental_status(status_path)
+            out = Path(tmp) / "snap"
+            config = replace(
+                CONFIG,
+                events_datasets=(),
+                include_intraday=False,
+            )
+            SnapshotBuilder(raw, events_root, status_path).build_decision_snapshot(
+                DECISION, out, config
+            )
+            self.assertFalse((out / "events.parquet").exists())
+            manifest = load_snapshot_manifest(out)
+            self.assertTrue(manifest["domains"]["events"].get("skipped"))
+
+    def test_later_decision_reuses_prior_events_and_unions_only_the_new_slice(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            raw = Path(tmp) / "raw"
+            events_root = Path(tmp) / "fund_events"
+            status_path = Path(tmp) / "fundamental_events_status.json"
+            build_raw(raw)
+            build_fundamental_events(events_root)
+            write_fundamental_status(status_path)
+            first = Path(tmp) / "first"
+            builder = SnapshotBuilder(raw, events_root, status_path)
+            config = replace(CONFIG, include_intraday=False)
+            builder.build_decision_snapshot(DECISION, first, config)
+            later = datetime(2021, 10, 11, 9, 25, tzinfo=CN_TZ)
+            write(
+                raw / "daily" / "trade_date=20211011.parquet",
+                pd.DataFrame(
+                    [
+                        {
+                            "trade_date": "20211011",
+                            "ts_code": "000001.SZ",
+                            "open": 10.0,
+                            "high": 11.0,
+                            "low": 9.5,
+                            "close": 10.6,
+                            "pre_close": 10.5,
+                            "pct_chg": 1.0,
+                            "vol": 1000.0,
+                            "amount": 1060.0,
+                        }
+                    ]
+                ),
+            )
+            write(
+                raw / "daily_basic" / "trade_date=20211011.parquet",
+                pd.DataFrame(
+                    [
+                        {
+                            "trade_date": "20211011",
+                            "ts_code": "000001.SZ",
+                            "turnover_rate": 2.0,
+                            "dv_ttm": 3.0,
+                            "pe": 10.0,
+                            "total_share": 100.0,
+                            "total_mv": 1000.0,
+                            "close": 10.6,
+                            "circ_mv": 2_000_000.0,
+                        }
+                    ]
+                ),
+            )
+            write(
+                raw / "margin_secs" / "trade_date=20211011.parquet",
+                pd.DataFrame(
+                    [
+                        {
+                            "trade_date": "20211011",
+                            "ts_code": "000001.SZ",
+                            "available_at": "2021-10-11T09:00:00+08:00",
+                            "available_at_rule": "same_day_preopen",
+                        }
+                    ]
+                ),
+            )
+            second = Path(tmp) / "second"
+            manifest = builder.build_decision_snapshot(
+                later,
+                second,
+                config,
+                prior_events=(first / "events.parquet", DECISION),
+            )
+            self.assertTrue(manifest["domains"]["events"].get("incremental"))
+            events = pd.read_parquet(second / "events.parquet")
+            dates = set(events["trade_date"].astype(str))
+            self.assertIn("20211008", dates)
+            self.assertIn("20211011", dates)
+
     def test_forward_unlock_events_survive_the_decision_window(self):
         # IPO lockups announce years ahead: windowing on announcement recency
         # alone hid the largest near-term unlocks (measured 56.8% of the

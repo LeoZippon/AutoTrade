@@ -1392,6 +1392,7 @@ def _llm_settings(
     for role in ("main", "meta", "nl", "compact"):
         settings.build_gateway(role, require_credentials=not preflight)
     _validate_local_context(settings)
+    gpu_count = _gpu_count(params.get("gpu_count", SandboxSpec().gpu_count))
     sandbox = SandboxSpec(
         image=str(params.get("agent_sandbox_image") or DEFAULT_IMAGE),
         cpus=_positive_float(
@@ -1406,7 +1407,8 @@ def _llm_settings(
         tmpfs_size=_memory_limit(
             params.get("agent_sandbox_tmpfs", "1g"), "agent_sandbox_tmpfs"
         ),
-        gpu_count=_gpu_count(params.get("gpu_count", SandboxSpec().gpu_count)),
+        gpu=None if gpu_count == 0 else "auto",
+        gpu_count=gpu_count,
     )
     return settings, sandbox
 
@@ -1468,9 +1470,9 @@ def _positive_int(value: object, name: str) -> int:
 
 def _gpu_count(value: object) -> int:
     """Per-session GPU allocation shares this range with `set_gpu_count`."""
-    count = _positive_int(value, "gpu_count")
+    count = _nonnegative_int(value, "gpu_count")
     if count > 4:
-        raise ValueError("gpu_count must be between 1 and 4")
+        raise ValueError("gpu_count must be between 0 and 4")
     return count
 
 

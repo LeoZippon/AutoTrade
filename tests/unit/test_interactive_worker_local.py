@@ -1060,7 +1060,7 @@ def test_preflight_narrows_exactly_three_things_and_nothing_else(
             )
 
     # And every parameter check still runs in pre-flight mode.
-    with pytest.raises(ValueError, match="gpu_count must be between 1 and 4"):
+    with pytest.raises(ValueError, match="gpu_count must be between 0 and 4"):
         resolve(True, gpu_count=9)
     with pytest.raises(ValueError, match="epochs must be a positive integer"):
         resolve(True, epochs=-1)

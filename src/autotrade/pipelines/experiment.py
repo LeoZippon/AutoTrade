@@ -880,8 +880,8 @@ def _agent_visible_fold(fold: FoldSpec) -> dict[str, object]:
 def _optional_gpu_count(value: object) -> int | None:
     if value is None:
         return None
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        raise ValueError("sandbox_gpu_count override must be a positive integer")
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 4:
+        raise ValueError("sandbox_gpu_count override must be an integer in 0..4")
     return value
 
 

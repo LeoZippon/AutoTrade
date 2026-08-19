@@ -122,9 +122,11 @@ class SandboxSpec:
         if (
             isinstance(self.gpu_count, bool)
             or not isinstance(self.gpu_count, int)
-            or self.gpu_count <= 0
+            or self.gpu_count < 0
         ):
-            raise ValueError("gpu_count must be a positive integer")
+            raise ValueError("gpu_count cannot be negative")
+        if self.gpu is not None and self.gpu_count <= 0:
+            raise ValueError("gpu_count must be a positive integer when GPUs are requested")
 
     @classmethod
     def from_host_fraction(cls, fraction: float = DEFAULT_HOST_FRACTION, **overrides: object) -> SandboxSpec:

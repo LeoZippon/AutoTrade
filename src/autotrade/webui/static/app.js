@@ -3079,8 +3079,10 @@ function gpuAllocationRow(detail, session, send) {
   select.append(
     el("option", { value: "" }, `实验默认（${experimentDefault} 块）`),
   );
-  for (let n = 1; n <= 4; n += 1)
-    select.append(el("option", { value: String(n) }, `${n} 块`));
+  for (let n = 0; n <= 4; n += 1)
+    select.append(
+      el("option", { value: String(n) }, n === 0 ? "0 块（CPU）" : `${n} 块`),
+    );
   if (current) select.value = String(current);
   const row = el(
     "div",

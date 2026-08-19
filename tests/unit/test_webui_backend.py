@@ -2971,7 +2971,12 @@ class HitlControlActionTest(unittest.TestCase):
         cleared = self._post(action="set_gpu_count", session_key=key, directive="")
         self.assertEqual(cleared.json()["control"]["gpu_counts"], {})
         self.assertEqual(self._control().gpu_counts, {})
-        for directive, fragment in (("5", "1..4"), ("0", "1..4"), ("abc", "正整数")):
+        zero = self._post(action="set_gpu_count", session_key=key, directive="0")
+        self.assertEqual(zero.status_code, 200, zero.text)
+        self.assertEqual(zero.json()["control"]["gpu_counts"], {key: 0})
+        cleared = self._post(action="set_gpu_count", session_key=key, directive="")
+        self.assertEqual(cleared.json()["control"]["gpu_counts"], {})
+        for directive, fragment in (("5", "0..4"), ("abc", "整数")):
             with self.subTest(directive=directive):
                 refused = self._post(
                     action="set_gpu_count", session_key=key, directive=directive

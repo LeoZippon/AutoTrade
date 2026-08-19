@@ -730,9 +730,9 @@ class ExperimentManager:
                 try:
                     count = int(raw)
                 except ValueError as exc:
-                    raise ManagerError("GPU 数量必须是正整数") from exc
-                if not 1 <= count <= 4:
-                    raise ManagerError("GPU 数量须在 1..4 之间")
+                    raise ManagerError("GPU 数量必须是整数") from exc
+                if not 0 <= count <= 4:
+                    raise ManagerError("GPU 数量须在 0..4 之间")
                 control.gpu_counts[session_key] = count
             else:
                 control.gpu_counts.pop(session_key, None)

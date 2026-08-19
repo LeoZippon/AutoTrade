@@ -403,8 +403,7 @@ _REJECTED_CREATES = (
     ({"compact_max_calls": -1}, "compact_max_calls must be a non-negative integer"),
     ({"window_months": 0}, "window_months must be a positive integer"),
     # Range, not availability: a GPU-less host must still see this message.
-    ({"gpu_count": 9}, "gpu_count must be between 1 and 4"),
-    ({"gpu_count": 0}, "gpu_count must be a positive integer"),
+    ({"gpu_count": 9}, "gpu_count must be between 0 and 4"),
     ({"inference_time": "25:00"}, "inference_time must use 24-hour HH:MM"),
     ({"strategy_period": "fortnight"}, "period must be one of"),
     ({"reasoning_effort": "turbo"}, "reasoning_effort must be one of"),

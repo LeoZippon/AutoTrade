@@ -253,13 +253,16 @@ def test_run_fold_forwards_the_consoles_gpu_allocation_to_the_session_request(tm
     assert captured[-1].sandbox_gpu_count is None
 
 
-def test_run_fold_refuses_a_gpu_override_that_is_not_a_positive_integer(tmp_path: Path):
+def test_run_fold_refuses_a_gpu_override_that_is_not_in_0_to_4(tmp_path: Path):
     captured: list = []
     pipeline, fold = _pipeline_capturing_fold_requests(tmp_path, captured)
-    for bogus in (0, -1, True, "2", 2.0):
-        with pytest.raises(ValueError, match="positive integer"):
+    for bogus in (-1, True, "2", 2.0, 5):
+        with pytest.raises(ValueError, match="0..4"):
             pipeline.run_fold(
                 "epoch_001", fold, parent=None, taste="",
                 session_context={"sandbox_gpu_count": bogus},
             )
-    assert captured == [], "a rejected override must never reach the developer"
+    pipeline.run_fold(
+        "epoch_001", fold, parent=None, taste="", session_context={"sandbox_gpu_count": 0}
+    )
+    assert captured[-1].sandbox_gpu_count == 0

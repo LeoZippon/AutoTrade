@@ -403,10 +403,21 @@ class SnapshotBuilder:
     # ---- decision-input snapshot ----
 
     def build_decision_snapshot(
-        self, decision_time: datetime, output_dir: str | Path, config: SnapshotConfig | None = None
+        self,
+        decision_time: datetime,
+        output_dir: str | Path,
+        config: SnapshotConfig | None = None,
+        *,
+        prior_events: tuple[Path, datetime] | None = None,
     ) -> dict[str, object]:
         with self._raw_lake_guard() as raw_generation:
-            manifest = self._build_decision_snapshot_impl(decision_time, output_dir, config, raw_generation)
+            manifest = self._build_decision_snapshot_impl(
+                decision_time,
+                output_dir,
+                config,
+                raw_generation,
+                prior_events=prior_events,
+            )
         return manifest
 
     def _build_decision_snapshot_impl(
@@ -415,6 +426,8 @@ class SnapshotBuilder:
         output_dir: str | Path,
         config: SnapshotConfig | None,
         raw_generation: dict[str, object] | None,
+        *,
+        prior_events: tuple[Path, datetime] | None = None,
     ) -> dict[str, object]:
         config = config or SnapshotConfig()
         decision_time = decision_time if decision_time.tzinfo else decision_time.replace(tzinfo=CN_TZ)
@@ -506,8 +519,12 @@ class SnapshotBuilder:
 
         def build_events(_: Mapping[str, DomainBuildResult]) -> DomainBuildResult:
             started = time.perf_counter()
-            events, meta = self._build_available_at_domain(
-                config.events_datasets, decision_time, events_window_start, forward_events=True, screen=screened
+            events, meta = self._build_events_domain(
+                config.events_datasets,
+                decision_time,
+                events_window_start,
+                screen=screened,
+                prior_events=prior_events,
             )
             meta = {**meta, "rows": int(len(events))}
             profile = _write_with_profile(
@@ -542,28 +559,31 @@ class SnapshotBuilder:
             )
             return {"rows": int(len(universe))}, profile
 
-        task_results = _run_domain_tasks(
-            [
-                ("daily", (), build_daily),
-                ("intraday", ("daily",), build_intraday),
-                ("auction", (), build_auction),
-                ("fundamentals", (), build_fundamentals),
-                ("events", (), build_events),
-                ("macro", (), build_macro),
-                ("text", (), build_text),
-                ("universe", (), build_universe),
-            ]
-        )
-        for task_name, domain_name, file_name in (
+        tasks: list[DomainBuildTask] = [
+            ("daily", (), build_daily),
+            ("intraday", ("daily",), build_intraday),
+            ("auction", (), build_auction),
+            ("fundamentals", (), build_fundamentals),
+            ("macro", (), build_macro),
+            ("text", (), build_text),
+            ("universe", (), build_universe),
+        ]
+        harvest = [
             ("daily", "daily", "daily.parquet"),
             ("auction", "auction", "auction.parquet"),
             ("intraday", "intraday_1min", "intraday_1min.parquet"),
             ("fundamentals", "fundamentals", "fundamentals.parquet"),
-            ("events", "events", "events.parquet"),
             ("macro", "macro", "macro.parquet"),
             ("text", "text", "text_index.parquet"),
             ("universe", "universe", "universe.parquet"),
-        ):
+        ]
+        if config.events_datasets:
+            tasks.append(("events", (), build_events))
+            harvest.append(("events", "events", "events.parquet"))
+        else:
+            domains["events"] = {"rows": 0, "datasets": [], "skipped": True}
+        task_results = _run_domain_tasks(tasks)
+        for task_name, domain_name, file_name in harvest:
             domains[domain_name], profiles[file_name] = task_results[task_name]
         domains["universe_screen"] = {
             "active": screened is not None,
@@ -1402,6 +1422,88 @@ class SnapshotBuilder:
             },
         }
         return minute, meta
+
+    def _build_events_domain(
+        self,
+        datasets: tuple[str, ...],
+        decision_time: datetime,
+        window_start: pd.Timestamp,
+        *,
+        screen: frozenset[str] | None,
+        prior_events: tuple[Path, datetime] | None,
+    ) -> tuple[pd.DataFrame, dict[str, object]]:
+        if prior_events is not None:
+            prior_path, prior_time = prior_events
+            prior_time = (
+                prior_time
+                if prior_time.tzinfo
+                else prior_time.replace(tzinfo=CN_TZ)
+            ).astimezone(CN_TZ)
+            if prior_path.is_file() and prior_time < decision_time:
+                try:
+                    prior = pd.read_parquet(prior_path)
+                except (OSError, ValueError):
+                    prior = None
+                if prior is not None and "available_at" in prior.columns:
+                    return self._extend_prior_events(
+                        prior,
+                        prior_time,
+                        datasets,
+                        decision_time,
+                        window_start,
+                        screen=screen,
+                    )
+        return self._build_available_at_domain(
+            datasets,
+            decision_time,
+            window_start,
+            forward_events=True,
+            screen=screen,
+        )
+
+    def _extend_prior_events(
+        self,
+        prior: pd.DataFrame,
+        prior_time: datetime,
+        datasets: tuple[str, ...],
+        decision_time: datetime,
+        window_start: pd.Timestamp,
+        *,
+        screen: frozenset[str] | None,
+    ) -> tuple[pd.DataFrame, dict[str, object]]:
+        """Reuse a earlier decision events table and union only the new as-of slice.
+
+        Newly screened-in names do not receive events from before ``prior_time``;
+        the manifest records that limitation.
+        """
+
+        prior_at = to_cn_timestamps(prior["available_at"])
+        kept = prior[prior_at >= window_start].copy()
+        delta, meta = self._build_available_at_domain(
+            datasets,
+            decision_time,
+            pd.Timestamp(prior_time),
+            forward_events=True,
+            screen=screen,
+        )
+        if not delta.empty and "available_at" in delta.columns:
+            delta_at = to_cn_timestamps(delta["available_at"])
+            delta = delta[delta_at > prior_time].reset_index(drop=True)
+        frames = [frame.dropna(axis=1, how="all") for frame in (kept, delta) if not frame.empty]
+        merged = (
+            pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        )
+        if not merged.empty:
+            merged = merged.drop_duplicates(ignore_index=True)
+            merged = self._apply_screen(merged, screen)
+        return merged, {
+            **meta,
+            "incremental": True,
+            "prior_decision_time": prior_time.isoformat(),
+            "prior_rows_kept": int(len(kept)),
+            "delta_rows": int(len(delta)),
+            "new_universe_names_lack_pre_prior_events": True,
+        }
 
     def _build_available_at_domain(
         self,

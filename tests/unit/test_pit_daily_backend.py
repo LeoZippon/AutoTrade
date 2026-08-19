@@ -354,7 +354,7 @@ def test_research_pit_provider_reuses_completed_semantic_views(tmp_path: Path) -
         def __init__(self) -> None:
             self.calls: list[str] = []
 
-        def build_decision_snapshot(self, decision, output, config):
+        def build_decision_snapshot(self, decision, output, config, **_kwargs):
             del config
             self.calls.append("decision")
             output = Path(output)

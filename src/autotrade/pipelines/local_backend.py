@@ -448,6 +448,8 @@ class FoldBacktestTool(SessionTimeBudgetAware):
         self.backtests += 1
         result_name = f"valid_{self.backtests:03d}"
         revision_id = ""
+        node_id = None
+        evaluation = None
         try:
             with self.formal_guard():
                 check = self.modification_check.invoke({})
@@ -492,32 +494,34 @@ class FoldBacktestTool(SessionTimeBudgetAware):
                     models_root=typed.models_path,
                     attachments={"validation/result.json": evaluation.result_ref},
                 )
-            step = StepResult(node_id, revision_id, evaluation)
-            self.steps.append(step)
         except Exception as exc:
-            if self.request.record_failed_attempts:
-                self.tree.record_failed_attempt(
-                    epoch_id=self.request.epoch_id,
-                    fold_id=agent_visible_ref(
-                        self.request.fold.fold_id, prefix="fold_ref"
-                    ),
-                    run_id=self.request.run_id,
-                    result_name=result_name,
-                    error=f"{type(exc).__name__}: {exc}",
-                    metrics={"revision_id": revision_id} if revision_id else None,
+            if node_id is None or evaluation is None:
+                if self.request.record_failed_attempts:
+                    self.tree.record_failed_attempt(
+                        epoch_id=self.request.epoch_id,
+                        fold_id=agent_visible_ref(
+                            self.request.fold.fold_id, prefix="fold_ref"
+                        ),
+                        run_id=self.request.run_id,
+                        result_name=result_name,
+                        error=f"{type(exc).__name__}: {exc}",
+                        metrics={"revision_id": revision_id} if revision_id else None,
+                    )
+                self._append_manifest_summary(
+                    {
+                        "result_name": result_name,
+                        "mode": "valid",
+                        "status": "failed",
+                        "complete_validation": False,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
                 )
-            self._append_manifest_summary(
-                {
-                    "result_name": result_name,
-                    "mode": "valid",
-                    "status": "failed",
-                    "complete_validation": False,
-                    "error": f"{type(exc).__name__}: {exc}",
-                }
-            )
-            if isinstance(exc, (ToolError, TimeoutError)):
-                raise
-            raise ToolError(f"daily Validation failed: {exc}") from exc
+                if isinstance(exc, (ToolError, TimeoutError)):
+                    raise
+                raise ToolError(f"daily Validation failed: {exc}") from exc
+        assert node_id is not None and evaluation is not None
+        step = StepResult(node_id, revision_id, evaluation)
+        self.steps.append(step)
         self._append_manifest_summary(
             {
                 "result_name": result_name,
@@ -661,11 +665,14 @@ class LLMFoldDeveloper:
         paths = local.prepare_layout()
         # Per-session HITL override; the "auto" selector still picks that many
         # GPUs by free memory at container start.
-        sandbox_spec = (
-            self.sandbox_spec
-            if request.sandbox_gpu_count is None
-            else replace(self.sandbox_spec, gpu_count=int(request.sandbox_gpu_count))
-        )
+        if request.sandbox_gpu_count is None:
+            sandbox_spec = self.sandbox_spec
+        elif int(request.sandbox_gpu_count) == 0:
+            sandbox_spec = replace(self.sandbox_spec, gpu=None, gpu_count=0)
+        else:
+            sandbox_spec = replace(
+                self.sandbox_spec, gpu_count=int(request.sandbox_gpu_count)
+            )
         # RunManifest publishes two views of the same data: the host audit copy
         # under runtime/, and the allowlisted Agent-visible copy mounted at
         # /mnt/artifacts/run_manifest.json. It is also where every backtest
