@@ -559,13 +559,14 @@ class SnapshotBuilder:
             )
             return {"rows": int(len(universe))}, profile
 
+        # Ready tasks occupy worker slots in list order: text/macro before auction.
         tasks: list[DomainBuildTask] = [
             ("daily", (), build_daily),
             ("intraday", ("daily",), build_intraday),
+            ("text", (), build_text),
+            ("macro", (), build_macro),
             ("auction", (), build_auction),
             ("fundamentals", (), build_fundamentals),
-            ("macro", (), build_macro),
-            ("text", (), build_text),
             ("universe", (), build_universe),
         ]
         harvest = [
@@ -1471,14 +1472,29 @@ class SnapshotBuilder:
         *,
         screen: frozenset[str] | None,
     ) -> tuple[pd.DataFrame, dict[str, object]]:
-        """Reuse a earlier decision events table and union only the new as-of slice.
+        """Reuse an earlier decision events table and union only the new as-of slice.
 
-        Newly screened-in names do not receive events from before ``prior_time``;
-        the manifest records that limitation.
+        Kept prior rows use the same availability / forward-event window as a
+        full rebuild. Newly screened-in names do not receive events from before
+        ``prior_time``; the manifest records that limitation.
         """
 
         prior_at = to_cn_timestamps(prior["available_at"])
-        kept = prior[prior_at >= window_start].copy()
+        keep = prior_at >= window_start
+        start_day = window_start.strftime("%Y%m%d")
+        for dataset in datasets:
+            event_column = FORWARD_EVENT_DATE_COLUMNS.get(dataset)
+            if event_column is None:
+                continue
+            if event_column not in prior.columns:
+                raise ValueError(
+                    f"prior events file has no {event_column} column; cannot window forward events"
+                )
+            event_in_window = prior[event_column].fillna("").astype(str) >= start_day
+            if "dataset" in prior.columns:
+                event_in_window = event_in_window & (prior["dataset"].astype(str) == dataset)
+            keep = keep | event_in_window
+        kept = prior[keep].copy()
         delta, meta = self._build_available_at_domain(
             datasets,
             decision_time,

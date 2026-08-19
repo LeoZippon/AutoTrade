@@ -17,8 +17,10 @@ import json
 from collections.abc import Mapping
 from pathlib import Path
 
+from autotrade.environment.identity import agent_visible_ref
 from autotrade.environment.llm import ChatMessage
 from autotrade.environment.runtime import utc_now_iso
+from autotrade.pipelines.agent_views import agent_visible_metrics
 
 ANALYSIS_SCHEMA_VERSION = 1
 MAX_FILE_CHARS = 20_000
@@ -105,7 +107,18 @@ def analysis_paths(out_dir: Path, epoch_id: str, fold_id: str) -> tuple[Path, Pa
 
 def guarded_record_view(record: Mapping[str, object]) -> dict[str, object]:
     """Project a fold ledger record down to validation-only evidence."""
-    return {key: record.get(key) for key in _RECORD_FIELDS if record.get(key) is not None}
+    view = {
+        key: record.get(key) for key in _RECORD_FIELDS if record.get(key) is not None
+    }
+    fold_id = view.get("fold_id")
+    if isinstance(fold_id, str) and fold_id:
+        view["fold_id"] = agent_visible_ref(fold_id, prefix="fold_ref")
+    validation = view.get("validation_result")
+    if isinstance(validation, dict):
+        compact = agent_visible_metrics(validation)
+        if compact is not None:
+            view["validation_result"] = compact
+    return view
 
 
 def read_strategy_files(

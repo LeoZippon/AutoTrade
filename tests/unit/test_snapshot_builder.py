@@ -2110,6 +2110,68 @@ class SnapshotBuilderTest(unittest.TestCase):
                     ("share_float_complete",), DECISION, window_start, forward_events=True
                 )
 
+    def test_forward_unlock_events_survive_incremental_prior_reuse(self):
+        # Incremental reuse must not drop a long-announced unlock whose
+        # float_date is still in the decision window. The delta scan cannot
+        # resurrect it: available_at is years before prior_time.
+        with tempfile.TemporaryDirectory() as tmp:
+            raw = Path(tmp) / "raw"
+            events_root = Path(tmp) / "fund_events"
+            status_path = Path(tmp) / "fundamental_events_status.json"
+            build_raw(raw)
+            build_fundamental_events(events_root)
+            write_fundamental_status(status_path)
+            write(
+                raw / "share_float_complete" / "share_float_complete.parquet",
+                pd.DataFrame([
+                    {"ts_code": "688001.SH", "ann_date": "20190715", "float_date": "20211105",
+                     "float_share": 1e8, "available_at": "2019-07-15 23:59:59+08:00", "available_at_rule": "r"},
+                    {"ts_code": "600000.SH", "ann_date": "20190110", "float_date": "20200110",
+                     "float_share": 1e6, "available_at": "2019-01-10 23:59:59+08:00", "available_at_rule": "r"},
+                    {"ts_code": "000001.SZ", "ann_date": "20210901", "float_date": "20210910",
+                     "float_share": 1e6, "available_at": "2021-09-01 23:59:59+08:00", "available_at_rule": "r"},
+                ]),
+            )
+            prior_path = Path(tmp) / "prior_events.parquet"
+            pd.DataFrame([
+                {"dataset": "share_float_complete", "ts_code": "688001.SH", "ann_date": "20190715",
+                 "float_date": "20211105", "float_share": 1e8,
+                 "available_at": "2019-07-15 23:59:59+08:00", "available_at_rule": "r"},
+                {"dataset": "share_float_complete", "ts_code": "600000.SH", "ann_date": "20190110",
+                 "float_date": "20200110", "float_share": 1e6,
+                 "available_at": "2019-01-10 23:59:59+08:00", "available_at_rule": "r"},
+                {"dataset": "share_float_complete", "ts_code": "000001.SZ", "ann_date": "20210901",
+                 "float_date": "20210910", "float_share": 1e6,
+                 "available_at": "2021-09-01 23:59:59+08:00", "available_at_rule": "r"},
+            ]).to_parquet(prior_path, index=False)
+            config = replace(
+                CONFIG,
+                events_datasets=("share_float_complete",),
+                events_window_months=6,
+                include_intraday=False,
+            )
+            prior_time = datetime(2021, 10, 7, 9, 25, tzinfo=CN_TZ)
+            builder = SnapshotBuilder(raw, events_root, status_path)
+            manifest = builder.build_decision_snapshot(
+                DECISION, Path(tmp) / "snap", config, prior_events=(prior_path, prior_time)
+            )
+            self.assertTrue(manifest["domains"]["events"].get("incremental"))
+            events = pd.read_parquet(Path(tmp) / "snap" / "events.parquet")
+            self.assertEqual(set(events["ts_code"]), {"688001.SH", "000001.SZ"})
+
+            with self.assertRaises(ValueError):
+                builder._extend_prior_events(
+                    pd.DataFrame([
+                        {"dataset": "share_float_complete", "ts_code": "688001.SH",
+                         "available_at": "2019-07-15 23:59:59+08:00", "available_at_rule": "r"},
+                    ]),
+                    prior_time,
+                    ("share_float_complete",),
+                    DECISION,
+                    pd.Timestamp("2021-04-08", tz=CN_TZ),
+                    screen=None,
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

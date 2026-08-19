@@ -1131,16 +1131,42 @@ def visible_window_dates(manifest: Mapping[str, object]) -> set[str]:
     )
 
 
+def calendar_policy_violation(
+    text: str, *, window_dates: set[str] | None = None
+) -> str:
+    """Why this text contains a forbidden calendar date, or "" when it does not.
+
+    Welded date expressions (_DATE_EXPR) are always rejected. When window_dates
+    is given, the visible-window years/bounds are also rejected even if written
+    bare. Cadence words (季度/月/周) and plain counts/percentages are unaffected.
+    """
+    dates = set(window_dates or ())
+    bare_window = (
+        re.compile(
+            r"\b(?:"
+            + "|".join(re.escape(token) for token in sorted(dates, key=len, reverse=True))
+            + r")\b"
+            rf"(?!\s*[{_COUNT_UNITS}])"
+        )
+        if dates
+        else None
+    )
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        if _DATE_EXPR.search(line) or (bare_window and bare_window.search(line)):
+            return (
+                f"line {lineno} contains a calendar date (non-transferable): "
+                f"{line.strip()[:80]!r}"
+            )
+    return ""
+
+
 def taste_policy_violation(taste_path: Path, *, window_dates: set[str]) -> str:
     """Why this taste.md may not be accepted, or "" when it is acceptable.
 
     The Taste is injected into every later Fold prompt, so a calendar date in
     it carries hidden-schedule evidence forward, and a long process ledger
-    drowns the Fold contract. Reject overlong files and dates two ways, robust
-    to the visible fold switching years: generic date expressions (_DATE_EXPR),
-    plus the actual visible-window years/bounds read from the manifest even
-    when written bare. Cadence words (季度/月/周) and plain counts/percentages
-    are unaffected.
+    drowns the Fold contract. Empty/overlong files are rejected here; dates go
+    through calendar_policy_violation.
     """
     if not taste_path.exists():
         return "write taste.md before finishing"
@@ -1153,25 +1179,12 @@ def taste_policy_violation(taste_path: Path, *, window_dates: set[str]) -> str:
             f"taste.md is {nchars} characters; keep it to {TASTE_MAX_CHARS} "
             "as a short directional prior, then call finish_meta again"
         )
-    bare_window = (
-        re.compile(
-            r"\b(?:"
-            + "|".join(
-                re.escape(t) for t in sorted(window_dates, key=len, reverse=True)
-            )
-            + r")\b"
-            rf"(?!\s*[{_COUNT_UNITS}])"
+    violation = calendar_policy_violation(text, window_dates=window_dates)
+    if violation:
+        return (
+            f"taste.md {violation}; state it qualitatively (e.g. 样本交易日不足、按季度轮动) "
+            "with no year or window date, then call finish_meta again"
         )
-        if window_dates
-        else None
-    )
-    for lineno, line in enumerate(text.splitlines(), start=1):
-        if _DATE_EXPR.search(line) or (bare_window and bare_window.search(line)):
-            return (
-                f"taste.md line {lineno} contains a calendar date (non-transferable): "
-                f"{line.strip()[:80]!r}; state it qualitatively (e.g. 样本交易日不足、按季度轮动) "
-                "with no year or window date, then call finish_meta again"
-            )
     return ""
 
 

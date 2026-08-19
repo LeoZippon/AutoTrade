@@ -9,6 +9,7 @@ use creates strategy ticks or a minute-driven environment loop.
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import math
 import os
@@ -479,6 +480,13 @@ class PITDailyEvaluationBackend:
             replay_frames={key: value for key, value in frames.items() if key != "daily"} | {"daily": daily},
             replay_text_library_dir=(replay_dir / "text_library"),
             incremental_domains={"intraday_1min"} if minute_source is not None else None,
+            stash_dir=_asof_stash_dir(
+                snapshot_dir,
+                replay_dir,
+                hashlib.sha256(
+                    json.dumps(request.schedule.to_record(), sort_keys=True, default=str).encode()
+                ).hexdigest()[:12],
+            ),
         )
         lock = _AsOfReadOnlyView(asof_dir)
         lock.lock()
@@ -638,6 +646,7 @@ class PaperPITData:
             | {"daily": self.daily},
             replay_text_library_dir=self.replay_dir / "text_library",
             incremental_domains={"intraday_1min"} if self.minute_source is not None else None,
+            stash_dir=_asof_stash_dir(self.snapshot_dir, self.replay_dir, "paper"),
         )
         self._lock = _AsOfReadOnlyView(self.asof_dir)
         self._lock.lock()
@@ -705,23 +714,39 @@ class _AsOfReadOnlyView:
         chmod_tree(self.root, file_mode=0o444, dir_mode=0o555)
 
 
+def _asof_stash_dir(snapshot_dir: Path, replay_dir: Path, schedule_stamp: str) -> Path:
+    return snapshot_dir.parent.parent / "asof_stash" / (
+        f"{snapshot_dir.name}__{replay_dir.name}__{schedule_stamp}"
+    )
+
+
+_REPLAY_FRAME_CACHE: dict[str, dict[str, pd.DataFrame]] = {}
+
+
 def _load_replay_frames(replay_dir: Path) -> dict[str, pd.DataFrame]:
-    frames: dict[str, pd.DataFrame] = {}
-    for name, filename in (
-        ("daily", "daily.parquet"),
-        ("events", "events.parquet"),
-        ("macro", "macro.parquet"),
-        ("fundamentals", "fundamentals.parquet"),
-        ("auction", "auction.parquet"),
-        ("text_index", "text_index.parquet"),
-    ):
-        path = replay_dir / filename
-        if path.exists():
-            frames[name] = pd.read_parquet(path)
-        elif name == "daily":
-            raise FileNotFoundError(f"replay slot has no daily.parquet: {replay_dir}")
-        else:
-            frames[name] = pd.DataFrame()
+    key = str(replay_dir.resolve())
+    cached = _REPLAY_FRAME_CACHE.get(key)
+    if cached is None:
+        frames: dict[str, pd.DataFrame] = {}
+        for name, filename in (
+            ("daily", "daily.parquet"),
+            ("events", "events.parquet"),
+            ("macro", "macro.parquet"),
+            ("fundamentals", "fundamentals.parquet"),
+            ("auction", "auction.parquet"),
+            ("text_index", "text_index.parquet"),
+        ):
+            path = replay_dir / filename
+            if path.exists():
+                frames[name] = pd.read_parquet(path)
+            elif name == "daily":
+                raise FileNotFoundError(f"replay slot has no daily.parquet: {replay_dir}")
+            else:
+                frames[name] = pd.DataFrame()
+        _REPLAY_FRAME_CACHE[key] = frames
+        cached = frames
+    frames = dict(cached)
+    frames["daily"] = cached["daily"].copy()
     return frames
 
 

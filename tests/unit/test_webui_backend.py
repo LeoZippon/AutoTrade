@@ -2401,6 +2401,8 @@ class WebuiBackendTest(unittest.TestCase):
         # schedule never reaches it.
         self.assertNotIn("2023Q1", payload["prompt"])
         self.assertNotIn("test_period", payload["prompt"])
+        self.assertNotIn("fold_2022Q2", payload["prompt"])
+        self.assertNotIn("2022Q2", payload["prompt"])
         refused = self.client.post(
             "/api/experiments/exp_hitl/prompt-preview", json={"session_key": "heldout"}
         )
@@ -2762,6 +2764,14 @@ class HitlControlActionTest(unittest.TestCase):
         self._post(
             action="set_directive", session_key="epoch_001/fold_2022Q2", directive=""
         )
+        self.assertNotIn("epoch_001/fold_2022Q2", self._control().directives)
+        dated = self._post(
+            action="set_directive",
+            session_key="epoch_001/fold_2022Q2",
+            directive="在 2022Q1 减仓",
+        )
+        self.assertEqual(dated.status_code, 400, dated.text)
+        self.assertIn("日历日期", dated.json()["detail"])
         self.assertNotIn("epoch_001/fold_2022Q2", self._control().directives)
 
     def test_set_prompt_override_stores_and_clears_a_replacement_prompt(self) -> None:

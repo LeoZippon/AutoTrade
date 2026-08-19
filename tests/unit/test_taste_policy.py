@@ -61,7 +61,9 @@ class TastePolicyTest(unittest.TestCase):
                 Path(tmp),
                 "# 品味\n## 一\n日内数据仅覆盖 21 个交易日（2021 年 8-9 月），样本不足。",
             )
-            violation = taste_policy_violation(path, window_dates=visible_window_dates(MANIFEST_2021))
+            violation = taste_policy_violation(
+                path, window_dates=visible_window_dates(MANIFEST_2021)
+            )
             self.assertTrue(violation)
             self.assertTrue(violation.startswith("taste.md line "))
             self.assertIn("calendar date", violation)
@@ -72,21 +74,30 @@ class TastePolicyTest(unittest.TestCase):
             # The 2024 window forbids a bare 2024 …
             self.assertIn(
                 "calendar date",
-                taste_policy_violation(path, window_dates=visible_window_dates(MANIFEST_2024)),
+                taste_policy_violation(
+                    path, window_dates=visible_window_dates(MANIFEST_2024)
+                ),
             )
             # … and the very same text is acceptable under the 2021 window, which
             # is the point: the rule follows the window, not a fixed year.
             self.assertEqual(
-                taste_policy_violation(path, window_dates=visible_window_dates(MANIFEST_2021)), ""
+                taste_policy_violation(
+                    path, window_dates=visible_window_dates(MANIFEST_2021)
+                ),
+                "",
             )
 
     def test_a_non_window_year_reading_as_a_regime_reference_is_allowed(self) -> None:
         with TemporaryDirectory() as tmp:
             path = _taste(
-                Path(tmp), "# 品味\n## 一\n借鉴 2008 式系统性风险的应对，按季度控制回撤。"
+                Path(tmp),
+                "# 品味\n## 一\n借鉴 2008 式系统性风险的应对，按季度控制回撤。",
             )
             self.assertEqual(
-                taste_policy_violation(path, window_dates=visible_window_dates(MANIFEST_2024)), ""
+                taste_policy_violation(
+                    path, window_dates=visible_window_dates(MANIFEST_2024)
+                ),
+                "",
             )
 
     def test_cadence_words_counts_and_percentages_are_transferable(self) -> None:
@@ -96,12 +107,17 @@ class TastePolicyTest(unittest.TestCase):
                 "# 品味\n## 一\n核心持仓按季度轮动；日内样本交易日不足（约 21 个），换手率 50%-80%。",
             )
             self.assertEqual(
-                taste_policy_violation(path, window_dates=visible_window_dates(MANIFEST_2021)), ""
+                taste_policy_violation(
+                    path, window_dates=visible_window_dates(MANIFEST_2021)
+                ),
+                "",
             )
 
     def test_a_ledger_length_taste_is_refused(self) -> None:
         with TemporaryDirectory() as tmp:
-            path = _taste(Path(tmp), "# 品味\n" + ("可迁移方向。\n" * (TASTE_MAX_CHARS // 6)))
+            path = _taste(
+                Path(tmp), "# 品味\n" + ("可迁移方向。\n" * (TASTE_MAX_CHARS // 6))
+            )
             violation = taste_policy_violation(path, window_dates=set())
             self.assertIn("characters", violation)
             self.assertIn(str(TASTE_MAX_CHARS), violation)
@@ -109,9 +125,13 @@ class TastePolicyTest(unittest.TestCase):
     def test_a_missing_or_empty_taste_is_refused(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
-            self.assertIn("write taste.md", taste_policy_violation(root / "taste.md", window_dates=set()))
             self.assertIn(
-                "non-empty", taste_policy_violation(_taste(root, "   \n"), window_dates=set())
+                "write taste.md",
+                taste_policy_violation(root / "taste.md", window_dates=set()),
+            )
+            self.assertIn(
+                "non-empty",
+                taste_policy_violation(_taste(root, "   \n"), window_dates=set()),
             )
 
 
@@ -121,7 +141,11 @@ class TasteFinishToolTest(unittest.TestCase):
 
     def _registry(self, root: Path, manifest: dict) -> ToolRegistry:
         return ToolRegistry(
-            [TasteFinishTool(SafeWorkspace(root), window_dates=visible_window_dates(manifest))]
+            [
+                TasteFinishTool(
+                    SafeWorkspace(root), window_dates=visible_window_dates(manifest)
+                )
+            ]
         )
 
     def test_finish_meta_refuses_a_dated_taste_with_a_typed_error(self) -> None:
@@ -138,7 +162,10 @@ class TasteFinishToolTest(unittest.TestCase):
     def test_finish_meta_accepts_a_transferable_taste_and_reports_done(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
-            _taste(root, "# 品味\n样本交易日不足时降低换手；按季度轮动，持仓不超过 2000 只股票。")
+            _taste(
+                root,
+                "# 品味\n样本交易日不足时降低换手；按季度轮动，持仓不超过 2000 只股票。",
+            )
             result = self._registry(root, MANIFEST_2021).invoke(
                 "finish_meta", {"taste_path": "taste.md"}
             )
@@ -152,9 +179,13 @@ class TasteFinishToolTest(unittest.TestCase):
             root = Path(tmp)
             registry = self._registry(root, MANIFEST_2021)
             _taste(root, "# 品味\n在 20211001 之后减仓。")
-            self.assertFalse(registry.invoke("finish_meta", {"taste_path": "taste.md"}).ok)
+            self.assertFalse(
+                registry.invoke("finish_meta", {"taste_path": "taste.md"}).ok
+            )
             _taste(root, "# 品味\n估值分位偏高时减仓，与具体日期无关。")
-            self.assertTrue(registry.invoke("finish_meta", {"taste_path": "taste.md"}).ok)
+            self.assertTrue(
+                registry.invoke("finish_meta", {"taste_path": "taste.md"}).ok
+            )
 
     def test_the_tool_refuses_a_path_outside_the_workspace(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -163,7 +194,9 @@ class TasteFinishToolTest(unittest.TestCase):
             outside = Path(tmp) / "taste.md"
             outside.write_text("# 品味\n可迁移。", encoding="utf-8")
             with self.assertRaises(ToolError):
-                TasteFinishTool(SafeWorkspace(root)).invoke({"taste_path": "../taste.md"})
+                TasteFinishTool(SafeWorkspace(root)).invoke(
+                    {"taste_path": "../taste.md"}
+                )
 
 
 if __name__ == "__main__":

@@ -2959,9 +2959,9 @@ function directivePanel(detail, session, waiting) {
           "button",
           {
             class: "btn",
-            onclick: () => openPromptEditor(detail, session, textarea.value),
+            onclick: () => openPromptEditor(detail, session),
           },
-          "编辑完整系统提示词",
+          "编辑额外用户指令",
         ),
       );
     }
@@ -3003,7 +3003,7 @@ function directivePanel(detail, session, waiting) {
     );
     if ((detail.control?.prompt_overrides || {})[session.key]) {
       buttons.append(
-        el("span", { class: "badge state-waiting_user" }, "已覆盖系统提示词"),
+        el("span", { class: "badge state-waiting_user" }, "已设置额外用户指令"),
       );
     }
   }
@@ -3259,30 +3259,14 @@ async function refreshDetail() {
   }
 }
 
-/* Full system-prompt editor: saves a verbatim per-session override. */
-async function openPromptEditor(detail, session, directive) {
-  const existing = (detail.control?.prompt_overrides || {})[session.key];
-  let text = existing || "";
-  if (!text) {
-    try {
-      const data = await api(
-        `/api/experiments/${encodeURIComponent(detail.experiment_id)}/prompt-preview`,
-        {
-          method: "POST",
-          body: JSON.stringify({ session_key: session.key, directive }),
-        },
-      );
-      text = data.prompt;
-    } catch (error) {
-      toast(`加载失败：${error.message}`, true);
-      return;
-    }
-  }
+/* Extra user-instruction editor: does not replace the runtime system prompt. */
+function openPromptEditor(detail, session) {
+  const existing = (detail.control?.prompt_overrides || {})[session.key] || "";
   const editor = el("textarea", {
     class: "directive prompt-editor",
     spellcheck: "false",
   });
-  editor.value = text;
+  editor.value = existing;
   const send = (payload, note) =>
     sendControlAction(detail.experiment_id, payload, note, { modal: true });
   const footer = [el("button", { class: "btn", onclick: closeModal }, "取消")];
@@ -3299,10 +3283,10 @@ async function openPromptEditor(detail, session, directive) {
                 session_key: session.key,
                 directive: "",
               },
-              "已清除覆盖，恢复自动装配",
+              "已清除额外用户指令",
             ),
         },
-        "清除覆盖",
+        "清除额外指令",
       ),
     );
   }
@@ -3318,21 +3302,21 @@ async function openPromptEditor(detail, session, directive) {
               session_key: session.key,
               directive: editor.value,
             },
-            "已保存系统提示词覆盖",
+            "已保存额外用户指令",
           ),
       },
-      "保存为本会话系统提示词",
+      "保存额外用户指令",
     ),
   );
   showModal(
-    `编辑系统提示词 — ${session.key}`,
+    `编辑额外用户指令 — ${session.key}`,
     el(
       "div",
       {},
       el(
         "div",
         { class: "hint warn" },
-        "保存后本会话将【原样】使用此文本作为系统提示词：运行时不再注入自动生成的「当前实验事实」JSON 与其它自动段落，请保留必要的协议/合同/禁止行为段落。清除覆盖即恢复自动装配。覆盖内容会记录进 run manifest 供审计。",
+        "这段文字是额外用户指令，不会替换运行时系统提示词；build_system_prompt 仍会装配稳定合同与动态事实。请勿写入 Test/Held-out 明细或焊接的日历日期。",
       ),
       editor,
     ),
@@ -3349,26 +3333,18 @@ async function openPromptPreview(
   directive,
   { approved, waiting, send },
 ) {
-  const override = (detail.control?.prompt_overrides || {})[session.key];
   let data;
-  if (override) {
-    data = {
-      prompt: override,
-      note: "当前已设置系统提示词覆盖，运行时将原样使用以下文本（不再自动装配）。",
-    };
-  } else {
-    try {
-      data = await api(
-        `/api/experiments/${encodeURIComponent(detail.experiment_id)}/prompt-preview`,
-        {
-          method: "POST",
-          body: JSON.stringify({ session_key: session.key, directive }),
-        },
-      );
-    } catch (error) {
-      toast(`预览失败：${error.message}`, true);
-      return;
-    }
+  try {
+    data = await api(
+      `/api/experiments/${encodeURIComponent(detail.experiment_id)}/prompt-preview`,
+      {
+        method: "POST",
+        body: JSON.stringify({ session_key: session.key, directive }),
+      },
+    );
+  } catch (error) {
+    toast(`预览失败：${error.message}`, true);
+    return;
   }
   const footer = [el("button", { class: "btn", onclick: closeModal }, "关闭")];
   if ((detail.control || {}).mode !== "auto" && !approved) {
@@ -4170,7 +4146,7 @@ function rerunPanel(detail, session) {
     el(
       "div",
       { class: "hint" },
-      "追加一次全新的 Fold 会话：账本新增记录（旧记录保留供审计），冻结产物以重跑标签另存，已有 Held-out 结果将在重跑后自动重放。启动后在本会话的指令面板修改指令或系统提示词，再批准运行。",
+      "追加一次全新的 Fold 会话：账本新增记录（旧记录保留供审计），冻结产物以重跑标签另存，已有 Held-out 结果将在重跑后自动重放。启动后在本会话的指令面板修改指令或额外用户指令，再批准运行。",
     ),
   );
   const bar = el("div", { class: "control-bar section-gap" });
@@ -4202,7 +4178,7 @@ function rerunPanel(detail, session) {
                 el(
                   "p",
                   { class: "hint" },
-                  "重跑会话默认等待批准：批准前可修改本 Fold 指令或编辑完整系统提示词。",
+                  "重跑会话默认等待批准：批准前可修改本 Fold 指令或额外用户指令。",
                 ),
               ),
               [

@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from autotrade.agent.prompts import build_meta_learning_prompt, build_system_prompt
+from autotrade.environment.identity import agent_visible_ref
 from autotrade.environment.strategy import StrategySchedule
 from autotrade.pipelines.hitl_state import (
     HITL_DIR_NAME,
@@ -52,19 +53,6 @@ def build_prompt_preview(
     )
     records = read_ledger_records(experiment_dir)
     if kind in {"meta", "meta_learning"}:
-        history = {
-            "folds": [
-                {
-                    "epoch_id": row.get("epoch_id"),
-                    "fold_id": row.get("fold_id"),
-                    "fold_status": row.get("fold_status"),
-                    "validation_result": row.get("validation_result"),
-                    "accept_warnings": row.get("accept_warnings"),
-                }
-                for row in records
-                if row.get("record_type") == "fold"
-            ]
-        }
         previous = next(
             (
                 str(row.get("taste") or "")
@@ -76,7 +64,7 @@ def build_prompt_preview(
         prompt = "\n\n".join(
             [
                 build_system_prompt(timing, mode="meta"),
-                build_meta_learning_prompt(history, previous),
+                build_meta_learning_prompt(None, previous),
                 f"研究者指令：{directive.strip()}"
                 if directive.strip()
                 else "研究者指令：无额外指令。",
@@ -90,6 +78,8 @@ def build_prompt_preview(
         for key in ("epoch_id", "fold_id", "fold_index")
         if entry.get(key) is not None
     }
+    if "fold_id" in facts:
+        facts["fold_id"] = agent_visible_ref(facts["fold_id"], prefix="fold_ref")
     facts.update(
         {
             "max_steps": params.get("max_steps_per_fold", 10),

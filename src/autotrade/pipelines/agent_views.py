@@ -218,7 +218,10 @@ def agent_visible_step_record(record: dict[str, object]) -> dict[str, object]:
         "decision_reason",
         "summary",
     }
-    return {key: value for key, value in record.items() if key in allowed}
+    public = {key: value for key, value in record.items() if key in allowed}
+    if "summary" in public:
+        public["summary"] = _visible_metrics(public.get("summary"))
+    return public
 
 
 def _read_json(path: Path) -> dict[str, object]:

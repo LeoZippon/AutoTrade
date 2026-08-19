@@ -25,6 +25,8 @@ from autotrade.pipelines.pit_backend import (
     HistoricalMinuteSource,
     PITDailyEvaluationBackend,
     ResearchPITSnapshotProvider,
+    _asof_stash_dir,
+    _load_replay_frames,
 )
 
 
@@ -443,6 +445,41 @@ def test_historical_minutes_resolve_only_the_exact_pit_price(tmp_path: Path) -> 
     assert source.price_at(
         "000001.SZ", datetime.fromisoformat("2024-01-02T10:02:00+08:00")
     ) is None
+
+
+def test_load_replay_frames_reuses_cached_parquets(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    replay = tmp_path / "replay"
+    replay.mkdir()
+    pd.DataFrame({"trade_date": ["20240102"], "close": [1.0]}).to_parquet(
+        replay / "daily.parquet", index=False
+    )
+    pd.DataFrame({"trade_date": ["20240102"]}).to_parquet(replay / "events.parquet", index=False)
+
+    calls = {"n": 0}
+    real_read = pd.read_parquet
+
+    def counting_read_parquet(path, *args, **kwargs):
+        calls["n"] += 1
+        return real_read(path, *args, **kwargs)
+
+    monkeypatch.setattr(pd, "read_parquet", counting_read_parquet)
+    first = _load_replay_frames(replay)
+    first_reads = calls["n"]
+    assert first_reads >= 1
+    first["daily"].loc[:, "close"] = 99.0
+    second = _load_replay_frames(replay)
+    assert calls["n"] == first_reads
+    assert second["daily"] is not first["daily"]
+    assert list(second["daily"]["close"]) == [1.0]
+    assert second["events"] is first["events"]
+
+
+def test_asof_stash_dir_nests_under_cache_root(tmp_path: Path) -> None:
+    snapshot = tmp_path / "decision" / "20240101T235959+0800"
+    replay = tmp_path / "replay" / "20240102_20240103_20240101T235959+0800"
+    assert _asof_stash_dir(snapshot, replay, "paper") == tmp_path / "asof_stash" / (
+        "20240101T235959+0800__20240102_20240103_20240101T235959+0800__paper"
+    )
 
 
 def _write_domains(snapshot: Path, replay: Path) -> None:
